@@ -12,5 +12,5 @@ Contributions to the code-base are welcome!
 ## Source
 This repo is built off of work by Cindy Wang's Quantifying the effectiveness of multiple SAI strategies across different dimensions - ETCCDI indices. Please cite DOI 10.5281/zenodo.18880765
 
-## Acknowledgement
+## Usage policy
 These indices are processed G6-1.5K GeoMIP data, so any analyses using the data should follow [GeoMIP policy](https://climate.envsci.rutgers.edu/geomip/data.html) and invite modelling teams which produced the simulations to contribute as co-authors, if using within around the first year. We also ask that any users extend this offer to Cindy Wang, Alistair Duffey and John Orcutt as dataset producers. Contributions to the code 
