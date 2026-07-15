@@ -1132,10 +1132,23 @@ def compute_baseline_threshold(model, variable, percentile, baseline_period,
 # ============================================================================
 # SECTION 11  -  Index computation, ensemble mean, significance
 # ============================================================================
-def compute_index_for_members(data_dict, index_name, threshold, period):
+def compute_index_for_members(data_dict, index_name, threshold, period,
+                              freq='YS'):
     """
-    Compute the time-mean index field for each member. {member: DataArray}.
- 
+    Climatological index field per member, reduced over the window.
+    {member: DataArray}.
+
+    The reduction follows freq:
+      'YS' -> (lat, lon)         mean days per year over the window
+      'MS' -> (month, lat, lon)  mean days per calendar month, the seasonal
+                                 cycle
+
+    The monthly path groups by calendar month rather than averaging every month
+    together: a flat mean over all months returns the annual value divided by
+    twelve and discards the seasonal information. Summing the monthly field
+    over 'month' recovers the annual field, so the two frequencies stay
+    consistent by construction.
+
     squeeze(drop=True) removes xclim's singleton 'percentiles' dimension, which
     otherwise breaks contourf downstream.
     
@@ -1143,12 +1156,14 @@ def compute_index_for_members(data_dict, index_name, threshold, period):
     info = INDEX_REGISTRY[index_name]
     fn, thresh_kw, extra, var_kw = (info['xclim_fn'], info['threshold_kwarg'],
                                     info['extra_kwargs'], info['variable'])
+    _check_freq(index_name, freq)
     per_member = {}
     for m, data in data_dict.items():
         window = data.sel(time=period.slice())
-        kwargs = {var_kw: window, thresh_kw: threshold, 'freq': 'YS', **extra}
-        annual = fn(**kwargs).squeeze(drop=True)
-        per_member[m] = annual.mean('time')
+        kwargs = {var_kw: window, thresh_kw: threshold, 'freq': freq, **extra}
+        idx = fn(**kwargs).squeeze(drop=True)
+        per_member[m] = (idx.mean('time') if freq == 'YS'
+                         else idx.groupby('time.month').mean('time'))
     return per_member
  
  
@@ -1176,8 +1191,11 @@ def compute_significance(scenario_per_member, reference_per_member, equal_var=Fa
     r = xr.concat(list(reference_per_member.values()),
                   dim=pd.Index(list(reference_per_member.keys()), name='member'))
     _, p_val = stats.ttest_ind(s.values, r.values, axis=0, equal_var=equal_var)
-    return xr.DataArray(p_val, coords={'lat': s.lat, 'lon': s.lon},
-                        dims=['lat', 'lon'], name='p_value',
+    # Take the non-member dims from the input, so this works for annual
+    # (lat, lon) and monthly (month, lat, lon) fields alike.
+    template = s.isel(member=0, drop=True)
+    return xr.DataArray(p_val, coords=template.coords, dims=template.dims,
+                        name='p_value',
                         attrs={'test': 'Welch t-test',
                                'scenario_n': s.sizes['member'],
                                'reference_n': r.sizes['member']})
@@ -1661,7 +1679,7 @@ def save_nc_to_s3(obj, s3_path):
         os.remove(tmp)
 
 
-def compute_annual_index_for_member(da, index_name, threshold):
+def compute_annual_index_for_member(da, index_name, threshold, freq='YS'):
     """
     Annual index field (time, lat, lon) for one member, against a fixed
     baseline percentile. This is compute_index_for_members without the time mean,
@@ -1671,8 +1689,9 @@ def compute_annual_index_for_member(da, index_name, threshold):
     
     """
     info = INDEX_REGISTRY[index_name]
+    _check_freq(index_name, freq)
     kwargs = {info['variable']: da, info['threshold_kwarg']: threshold,
-              'freq': 'YS', **info['extra_kwargs']}
+              'freq': freq, **info['extra_kwargs']}
     annual = info['xclim_fn'](**kwargs).squeeze(drop=True)
     annual.name = index_name.upper()
     return annual
@@ -1683,7 +1702,8 @@ def write_index_dataset(model, index_name,
                         scenario_periods=None,
                         members_by_scenario=None,
                         ssp245_threshold_members=None,
-                        output_root=ETCCDI_OUTPUT_ROOT,
+                        output_root=None,
+                        freq='YS',
                         overwrite=False):
     """
     Compute one percentile index as per-member annual fields and write them to
@@ -1695,6 +1715,11 @@ def write_index_dataset(model, index_name,
     peak memory is one member's daily record.
     
     """
+    _check_freq(index_name, freq)
+    if output_root is None:
+        output_root = (ETCCDI_OUTPUT_ROOT if freq == 'YS'
+                       else ETCCDI_OUTPUT_ROOT.replace('_annual', '_monthly'))
+
     info = INDEX_REGISTRY[index_name]
     variable = info['variable']
     model_label = MODEL_LABEL[model]
@@ -1740,7 +1765,8 @@ def write_index_dataset(model, index_name,
             da = get_variable_info(model, variable)['converter'](ds)
             del ds
 
-            annual = compute_annual_index_for_member(da, index_name, threshold).load()
+            annual = compute_annual_index_for_member(
+                da, index_name, threshold, freq=freq).load()
             del da
             gc.collect()
 
@@ -2144,6 +2170,24 @@ def contrast_table(contrast, regions=REGIONS, drop_e3sm_temp=True):
 # E3SM daily temperature is unusable (TREFHTMX == TREFHTMN == TREFHT at source),
 # so temperature indices run on three models and precipitation on four.
 TEMP_INDICES = {'TX90p', 'TX10p', 'TN90p', 'TN10p'}
+SPELL_INDICES = {'WSDI', 'CSDI'}   # spells cross month boundaries: annual only
+SUPPORTED_FREQ = ('YS', 'MS')      # annual and monthly output resolution
+
+
+def _check_freq(index_name, freq):
+    """Validate an output frequency for an index.
+
+    Only annual ('YS') and monthly ('MS') are supported. Spell-length indices
+    are annual-only: their spells can cross month boundaries, so a monthly
+    count is not the ETCCDI quantity.
+    """
+    if freq not in SUPPORTED_FREQ:
+        raise ValueError(f'freq={freq!r} not supported; use one of '
+                         f'{SUPPORTED_FREQ}')
+    if freq != 'YS' and index_name in SPELL_INDICES:
+        raise ValueError(
+            f'{index_name} is spell-based and only defined at annual frequency '
+            f'(spells cross month boundaries); freq={freq!r} not supported')
 PRECIP_INDICES = {'R95p', 'R99p'}
 
 def MODELS_FOR(idx):
