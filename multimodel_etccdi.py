@@ -2,9 +2,7 @@
 multimodel_etccdi.py
 
 Core pipeline for the multi-model ETCCDI extremes analysis of G6-1.5K-SAI and
-G6-1.5K-HiLLA (deliverables D1/D2). Extracted from
-multimodel_etccdi_indices_edited_0627.ipynb so demo notebooks import it instead
-of carrying the definitions themselves.
+G6-1.5K-HiLLA (deliverables D1/D2). 
 
 Contents: run configuration (Period, ComparisonConfig, windows), per-model
 bucket layouts and native-variable converters (pr, tasmax, tasmin, tas, psl,
@@ -14,7 +12,7 @@ land masking, and the summary plotting kept for analysis notebooks:
 plot_all_mod_comparisons, plot_contrast_summary, contrast_table,
 plot_medit_contrast_bars.
 
-Written by Francis Osei Tutu Afrifa, 2026. Reflective internship, Track A.
+Written by Francis Osei Tutu Afrifa, 2026.
 """
 
 # Written by Francis Osei Tutu Afrifa, 2026
@@ -49,7 +47,10 @@ import xclim
 from xclim.core.calendar import percentile_doy
 from xclim.core.units import convert_units_to
 from xclim.indices import (days_over_precip_thresh, tx90p, tx10p, tn90p, tn10p,
-                           warm_spell_duration_index, cold_spell_duration_index)
+                           warm_spell_duration_index, cold_spell_duration_index,
+                           growing_season_length, growing_degree_days,
+                           max_1day_precipitation_amount,
+                           max_n_day_precipitation_amount) # added fixed precipitation thresholds and GDD and GSL
 
 
 import uuid
@@ -171,6 +172,19 @@ All SSP245 runs extend past 2084.
 BASELINE   = Period('baseline',   2020, 2039)
 ASSESSMENT = Period('assessment', 2065, 2084)
 
+# Per-model percentile baseline. MIROC-ES2H SSP2-4.5 begins in 2020: Shingo
+# confirmed (September 2026) that 2015-2019 was never run, because the 2020
+# SSP2-4.5 was initialised separately from combined prior runs plus a short
+# spin-up. Its window is therefore 15 years against 20, so its day-of-year
+# percentiles rest on 75 samples against 100. The gap is widest for R99p, where
+# only wet days enter the estimate.
+BASELINE_BY_MODEL = {
+    'CESM':  Period('baseline', 2015, 2034),
+    'UKESM': Period('baseline', 2015, 2034),
+    'MIROC': Period('baseline', 2020, 2034),
+    'E3SM':  Period('baseline', 2015, 2034),
+}
+
 # Per-model assessment window. CESM is 2050-2069 because its SSP245 members
 # r7-r10 end in 2070 (Alistair: use the last 20 years all members share). The
 # others keep the 2065-2084 default. Note for later: E3SM G6-1.5K-SAI tasmax
@@ -184,6 +198,17 @@ ASSESSMENT_BY_MODEL = {
 }
 
 SAI_WINDOW = Period('assessment', 2050, 2069)   # common to all four models' SAI runs
+
+def baseline_for(model):
+    """
+    Percentile baseline for a model. BASELINE remains the 2020-2039 window
+    the existing archive was built on; this table is the newer one, and callers
+    ask for it explicitly rather than getting it by default, so nothing already
+    written changes basis without someone deciding to.
+    
+    """
+    return BASELINE_BY_MODEL[model]
+
 
 def assessment_for(model):
     """
@@ -223,7 +248,8 @@ def make_comparison_config(comparison_type='combined', assessment=ASSESSMENT):
             scenario_name='HiLLA', scenario_period=assessment,
             reference_name='SSP245', reference_period=assessment,
             baseline_for_percentile=BASELINE,
-            label='SAI (2\u21923)',
+            # label='SAI (2\u21923)',
+            label='G6-1.5K-HiLLA (2\u21923)',
         )
     elif ct in ('combined', 'same_temperature', '1to3'):
         # 1 -> 3: warming + SAI. Residual at matched GMST against the baseline.
@@ -231,7 +257,8 @@ def make_comparison_config(comparison_type='combined', assessment=ASSESSMENT):
             scenario_name='HiLLA', scenario_period=assessment,
             reference_name='SSP245', reference_period=BASELINE,
             baseline_for_percentile=BASELINE,
-            label='Warming + SAI (1\u21923)',
+            # label='Warming + SAI (1\u21923)',
+            label='Warming + G6-1.5K-HiLLA (1\u21923)',
         )
 
     elif ct in ('sai_vs_hilla', 'injection_latitude'):
@@ -245,6 +272,29 @@ def make_comparison_config(comparison_type='combined', assessment=ASSESSMENT):
             reference_name='HiLLA', reference_period=assessment,
             baseline_for_percentile=BASELINE,
             label='SAI vs HiLLA (injection latitude)',
+        )
+
+    elif ct in ('subtropical', 'sai_only'):
+        # 2 -> 3 for G6-1.5K-SAI. Identical construction to the 'sai' key
+        # above, which despite its name carries G6-1.5K-HiLLA, so the two
+        # injection strategies are decomposed the same way and their aerosol
+        # steps are directly comparable.
+        return ComparisonConfig(
+            scenario_name='SAI', scenario_period=assessment,
+            reference_name='SSP245', reference_period=assessment,
+            baseline_for_percentile=BASELINE,
+            label='G6-1.5K-SAI (2\u21923)',
+        )
+
+    elif ct in ('subtropical_combined', 'sai_combined'):
+        # 1 -> 3 for G6-1.5K-SAI. Completes the decomposition, so additivity
+        # can be checked against the shared warming step the same way it was
+        # for HiLLA.
+        return ComparisonConfig(
+            scenario_name='SAI', scenario_period=assessment,
+            reference_name='SSP245', reference_period=BASELINE,
+            baseline_for_percentile=BASELINE,
+            label='Warming + G6-1.5K-SAI (1\u21923)',
         )
         
     else:
@@ -1044,6 +1094,59 @@ def load_scenario_members(model, variable, scenario, period, members=None):
 # is why the masking must happen here at the threshold step. Temperature indices
 # carry no 'wet_day_thresh' key and are computed over all days as usual.
 
+def _complete_bins(src, freq, min_days=360):
+    """
+    Boolean mask over resampled bins: True where a bin is fully covered by
+    the record. xclim returns a value (0 days, not NaN) for a partial bin at
+    either end of the record, which would otherwise average in as a real
+    season.
+    
+    """
+    ones = xr.DataArray(np.ones(src.sizes['time']), dims='time',
+                        coords={'time': src['time']})
+    return ones.resample(time=freq).count() >= min_days
+
+
+def growing_season_length_global(tas, freq='YS', **kwargs):
+    """
+    Growing season length over both hemispheres.
+
+    The NH growing season falls inside a calendar year, so it uses
+    mid_date='07-01' on a January-December year. The SH season straddles the
+    new year, so it uses mid_date='01-01' on a July-June year (freq='YS-JUL')
+    and is labelled by the calendar year in which it begins: an SH value
+    stamped YYYY covers the season starting July YYYY. Both hemispheres are
+    relabelled onto a common January-stamped axis so they concatenate and so
+    .dt.year keeps working downstream. Partial seasons at the ends of the
+    record are dropped, which is why the final SH year is NaN for a record
+    ending in December: that season needs the following January to June.
+    
+    """
+    if freq != 'YS':
+        raise ValueError(f'growing_season_length is annual-only; got {freq!r}')
+    lat = tas['lat']
+    out = []
+    for hemi, mid, f in (('nh', '07-01', 'YS'), ('sh', '01-01', 'YS-JUL')):
+        sub = (tas.where(lat >= 0, drop=True) if hemi == 'nh'
+               else tas.where(lat < 0, drop=True))
+        if sub.sizes.get('lat', 0) == 0:
+            continue
+        g = growing_season_length(sub, mid_date=mid, freq=f, **kwargs)
+        g = g.isel(time=_complete_bins(sub, f).values)
+        cal = type(g['time'].values[0])
+        g = g.assign_coords(
+            time=[cal(int(y), 1, 1) for y in g['time'].dt.year.values])
+        out.append(g)
+    if not out:
+        raise ValueError('no latitudes in the input')
+    return xr.concat(out, dim='lat', join='outer',
+                     combine_attrs='override').sortby('lat')
+
+
+# Percentile indices carry 'percentile' and a 'threshold_kwarg' naming the
+# xclim argument that receives the baseline threshold. Fixed-threshold indices
+# (Cindy Wang's growing-season pair) set both to None: they need no baseline,
+# and their threshold lives in 'extra_kwargs'.
 INDEX_REGISTRY = {
     'R95p': {'variable': 'pr',     'percentile': 95, 'xclim_fn': days_over_precip_thresh,
              'threshold_kwarg': 'pr_per',     'extra_kwargs': {'thresh': '1 mm/day'}},
@@ -1061,6 +1164,45 @@ INDEX_REGISTRY = {
              'threshold_kwarg': 'tasmax_per', 'extra_kwargs': {'window': 6}},
     'CSDI': {'variable': 'tasmin', 'percentile': 10, 'xclim_fn': cold_spell_duration_index,
              'threshold_kwarg': 'tasmin_per', 'extra_kwargs': {'window': 6}},
+    # --- fixed-threshold indices (no baseline percentile) ---
+    'GSL': {'variable': 'tas', 'percentile': None,
+            'xclim_fn': growing_season_length_global, 'threshold_kwarg': None,
+            'extra_kwargs': {'thresh': '5.0 degC', 'window': 6, 'op': '>='},
+            'attrs': {'long_name': 'Growing season length',
+                      'comment': ('Days between the first {window}-day run with '
+                                  'tas {op} {thresh} and the first {window}-day run '
+                                  'below it thereafter. Hemisphere-aware: northern '
+                                  'gridpoints use mid_date 07-01 on a calendar year, '
+                                  'southern gridpoints use mid_date 01-01 on a '
+                                  'July-June year relabelled to January stamps. '
+                                  'Southern final year is NaN because a July-June '
+                                  'bin needs data into the following Jan-Jun.')}},
+    'GDD': {'variable': 'tas', 'percentile': None,
+            'xclim_fn': growing_degree_days, 'threshold_kwarg': None,
+            'extra_kwargs': {'thresh': '4.0 degC'},
+            'attrs': {'long_name': 'Growing degree days above {thresh}',
+                      'comment': ('Sum of daily (tas - {thresh}) over days with '
+                                  'tas > {thresh}. Units are kelvin-days; '
+                                  'numerically identical to Celsius degree-days '
+                                  'because the index is a sum of temperature '
+                                  'differences.')}},
+    
+    'RX1D': {'variable': 'pr', 'percentile': None,
+             'xclim_fn': max_1day_precipitation_amount,
+             'threshold_kwarg': None, 'extra_kwargs': {},
+             'attrs': {'long_name': 'Maximum 1-day precipitation',
+                       'comment': ('Largest single-day precipitation total in the '
+                                   'aggregation period. Name follows the '
+                                   'ReflectiveCloud/etccdi-indices zarr store so the '
+                                   'two index sets merge without renaming.')}},
+    'RX5D': {'variable': 'pr', 'percentile': None,
+             'xclim_fn': max_n_day_precipitation_amount,
+             'threshold_kwarg': None, 'extra_kwargs': {'window': 5},
+             'attrs': {'long_name': 'Maximum 5-day precipitation',
+                       'comment': ('Largest precipitation total over 5 consecutive '
+                                   'days in the aggregation period. Name follows the '
+                                   'ReflectiveCloud/etccdi-indices zarr store so the '
+                                   'two index sets merge without renaming.')}},
 }
  
  
@@ -1089,6 +1231,13 @@ def compute_baseline_threshold(model, variable, percentile, baseline_period,
         (NaN); those cells correctly drop out of the precip index.
         
     """
+    if percentile is None:
+        # Fixed-threshold index (e.g. GSL, GDD): its threshold is a constant in
+        # extra_kwargs, so there is no baseline percentile to compute. Returning
+        # the same (threshold, baseline_data) shape as the percentile path keeps
+        # every caller working without a special case.
+        return None, None
+
     print(f"\nComputing baseline {model}/{variable} P{percentile} threshold from "
           f"SSP245 {baseline_period.start_year}-{baseline_period.end_year}...")
     baseline_data = load_scenario_members(model, variable, 'SSP245',
@@ -1132,8 +1281,8 @@ def compute_baseline_threshold(model, variable, percentile, baseline_period,
 # ============================================================================
 # SECTION 11  -  Index computation, ensemble mean, significance
 # ============================================================================
-def compute_index_for_members(data_dict, index_name, threshold, period,
-                              freq='YS'):
+def compute_index_for_members(data_dict, index_name, threshold, 
+                              period, freq='YS', season='DJF'):
     """
     Climatological index field per member, reduced over the window.
     {member: DataArray}.
@@ -1156,14 +1305,52 @@ def compute_index_for_members(data_dict, index_name, threshold, period,
     info = INDEX_REGISTRY[index_name]
     fn, thresh_kw, extra, var_kw = (info['xclim_fn'], info['threshold_kwarg'],
                                     info['extra_kwargs'], info['variable'])
-    _check_freq(index_name, freq)
+    
+    _check_freq(index_name, freq, season)
     per_member = {}
     for m, data in data_dict.items():
         window = data.sel(time=period.slice())
-        kwargs = {var_kw: window, thresh_kw: threshold, 'freq': freq, **extra}
+        kwargs = {var_kw: window, 'freq': freq, **extra}
+        if thresh_kw is not None:       # fixed-threshold indices take none
+            kwargs[thresh_kw] = threshold
         idx = fn(**kwargs).squeeze(drop=True)
-        per_member[m] = (idx.mean('time') if freq == 'YS'
-                         else idx.groupby('time.month').mean('time'))
+        # xclim's indices layer sets 'units' and nothing else; the indicators
+        # layer would set a name, but we bypass it. Registry attrs fill that
+        # gap. Placeholders are filled from extra_kwargs so a user who changes
+        # the threshold does not get a file labelled with the old one. .get
+        # keeps registry entries without an 'attrs' key valid.
+        idx.attrs.update({k: v.format(**extra) if isinstance(v, str) else v
+                          for k, v in info.get('attrs', {}).items()})
+        
+        # keep_attrs is explicit: xarray's default differs between
+        # environments, and losing 'units' here silently unlabels every
+        # downstream plot and netCDF.
+        '''
+        per_member[m] = (idx.mean('time', keep_attrs=True) if freq == 'YS'
+                         else idx.groupby('time.month').mean('time',
+                                                             keep_attrs=True))
+        '''
+        if freq == 'YS':
+            # per_member[m] = idx.mean('time', keep_attrs=True)
+            complete = _complete_bins(window, 'YS', min_days=360)
+            per_member[m] = idx.where(complete).mean('time', keep_attrs=True)
+            
+        elif freq == 'MS':
+            per_member[m] = idx.groupby('time.month').mean('time',
+                                                           keep_attrs=True)
+        
+        else:
+            # QS-DEC bins the year into DJF, MAM, JJA and SON, each stamped with
+            # the first month of its bin, so SEASON_STAMP[season] selects one.
+            # Both ends of the record hold a partial bin and xclim returns a
+            # value rather than NaN for one, so incomplete seasons are masked
+            # before averaging.
+            complete = _complete_bins(window, 'QS-DEC',
+                                      min_days=SEASON_MIN_DAYS)
+            idx = idx.where(complete)
+            sel = idx.sel(time=idx['time'].dt.month == SEASON_STAMP[season])
+            per_member[m] = sel.mean('time', keep_attrs=True)
+            
     return per_member
  
  
@@ -1173,8 +1360,9 @@ def ensemble_mean(per_member_dict):
     
     """
     stacked = xr.concat(list(per_member_dict.values()),
-                        dim=pd.Index(list(per_member_dict.keys()), name='member'))
-    return stacked.mean('member')
+                        dim=pd.Index(list(per_member_dict.keys()), name='member'),
+                        combine_attrs='override')
+    return stacked.mean('member', keep_attrs=True)
  
  
 def compute_significance(scenario_per_member, reference_per_member, equal_var=False):
@@ -1206,7 +1394,8 @@ def compute_significance(scenario_per_member, reference_per_member, equal_var=Fa
 # ============================================================================
 def run_comparison(model, index_name, config,
                    hilla_members=None, ssp245_members=None, sai_members=None,
-                   precomputed_threshold=None, precomputed_baseline_data=None):
+                   precomputed_threshold=None, precomputed_baseline_data=None,
+                   freq='YS'):
     """
     Run one anomaly comparison for one model and index.
  
@@ -1271,8 +1460,14 @@ def run_comparison(model, index_name, config,
     
     log_mem("after scenario load")
     print(f"\nComputing {index_name} for scenario...")
+    '''
     scenario_pm = compute_index_for_members(scenario_data, index_name,
                                             threshold, config.scenario_period)
+    '''
+    scenario_pm = compute_index_for_members(scenario_data, index_name,
+                                            threshold, config.scenario_period,
+                                            freq=freq)
+    
     scenario_mean = ensemble_mean(scenario_pm)
     del scenario_data
     gc.collect()
@@ -1300,8 +1495,13 @@ def run_comparison(model, index_name, config,
  
     # 4. Reference index, ensemble means.
     print(f"Computing {index_name} for reference...")
+    '''
     reference_pm = compute_index_for_members(reference_data, index_name,
                                              threshold, config.reference_period)
+    '''
+    reference_pm = compute_index_for_members(reference_data, index_name,
+                                             threshold, config.reference_period,
+                                             freq=freq)
     reference_mean = ensemble_mean(reference_pm)
     if not reused_baseline:
         del reference_data
@@ -1331,7 +1531,8 @@ def run_comparison(model, index_name, config,
 # ============================================================================
 # SECTION 13  -  Lee et al. (2026) three-way framework + additivity check
 # ============================================================================
-def run_lee_framework(model, index_name, hilla_members=None, ssp245_members=None):
+def run_lee_framework(model, index_name, hilla_members=None, ssp245_members=None,
+                      freq='YS', assessment=None):
     """
     Run warming, sai, and combined for one model+index, sharing the threshold.
  
@@ -1360,12 +1561,13 @@ def run_lee_framework(model, index_name, hilla_members=None, ssp245_members=None
  
     results = {}
     for key in ('warming', 'sai', 'combined'):
-        cfg = make_comparison_config(key, assessment_for(model))
+        cfg = make_comparison_config(key, assessment or assessment_for(model))
         print(f"\n----- {model} {index_name}: {cfg.label} -----")
         results[key] = run_comparison(
             model, index_name, cfg,
             hilla_members=hilla_members, ssp245_members=ssp245_members,
-            precomputed_threshold=threshold, precomputed_baseline_data=baseline_data)
+            precomputed_threshold=threshold, precomputed_baseline_data=baseline_data,
+            freq=freq)
     return results
  
  
@@ -1512,6 +1714,8 @@ def save_threshold(threshold, path):
     three Lee comparisons. Caching it means a kernel restart never recomputes it.
     
     """
+    if threshold is None:
+        return          # fixed-threshold index: nothing to cache
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     threshold.to_dataset(name='threshold').to_netcdf(path)
  
@@ -1528,7 +1732,8 @@ def load_threshold(path):
 
 
 def run_lee_framework_cached(model, index_name, hilla_members=None,
-                             ssp245_members=None, free_memory=True):
+                             ssp245_members=None, free_memory=True, freq='YS',
+                             assessment=None):
     """
     Run warming/sai/combined for one model+index with per-step disk caching.
  
@@ -1557,9 +1762,20 @@ def run_lee_framework_cached(model, index_name, hilla_members=None,
     cache = OUTDIR / 'cached_data'
     cache.mkdir(parents=True, exist_ok=True)
     
-    a = assessment_for(model)
+    # Caller-supplied window wins, so every model can be put on the shared
+    # 2050-2069 period. assessment_for(model) stays the default, which keeps
+    # existing call sites and their cache files valid. The window is already in
+    # the cache name, so the two periods coexist without colliding.
+    a = assessment or assessment_for(model)
     win = f"{a.start_year}_{a.end_year}"
-    comp_paths = {k: cache / f"{model.lower()}_{index_name.lower()}_{k}_{win}.nc"
+    # Frequency tag in the comparison cache names, empty for 'YS' so files
+    # written before this argument existed are still found. Without a tag a DJF
+    # run silently loads the annual result stored under the same model, index
+    # and window. The threshold file is deliberately left untagged: it is a
+    # day-of-year percentile over daily baseline data and does not depend on
+    # the output frequency, so a DJF run reuses it and skips percentile_doy.
+    ftag = '' if freq == 'YS' else '_' + freq.lower().replace('-', '')
+    comp_paths = {k: cache / f"{model.lower()}_{index_name.lower()}_{k}_{win}{ftag}.nc"
                   for k in keys}
     thr_path = cache / f"{model.lower()}_{index_name.lower()}_threshold.nc"
  
@@ -1590,12 +1806,13 @@ def run_lee_framework_cached(model, index_name, hilla_members=None,
         if comp_paths[k].exists():
             print(f"Cached {comp_paths[k].name} exists, skipping compute")
             continue
-        cfg = make_comparison_config(k, assessment_for(model))
+        cfg = make_comparison_config(k, a)
         print(f"\n----- {model} {index_name}: {cfg.label} -----")
         res = run_comparison(
             model, index_name, cfg,
             hilla_members=hilla_members, ssp245_members=ssp245_members,
-            precomputed_threshold=threshold, precomputed_baseline_data=None)
+            precomputed_threshold=threshold, precomputed_baseline_data=None,
+            freq=freq)
         save_result(res, comp_paths[k])
         print(f"  Saved {comp_paths[k].name}")
         if free_memory:
@@ -1603,13 +1820,14 @@ def run_lee_framework_cached(model, index_name, hilla_members=None,
             gc.collect()
  
     # --- Load all three from cache for return / plotting ---
-    return {k: load_result(comp_paths[k], make_comparison_config(k, assessment_for(model)),
+    return {k: load_result(comp_paths[k], make_comparison_config(k, a),
                            index_name, model) for k in keys}
 
 
 def run_comparison_cached(model, index_name, comparison_type,
                           hilla_members=None, ssp245_members=None,
-                          sai_members=None, assessment=None, free_memory=True):
+                          sai_members=None, assessment=None, free_memory=True,
+                          freq='YS'):
     """
     Run ONE comparison for a model+index with the same per-step disk caching
     as run_lee_framework_cached. For comparisons outside the warming/sai/combined
@@ -1617,11 +1835,14 @@ def run_comparison_cached(model, index_name, comparison_type,
     ({model}_{index}_threshold.nc), so it is reused if present.
     
     """
+    # NOTE: no window in this name. Safe while every call site passes the same
+    # assessment; two windows would collide. Add _{win} if that changes.
     cache = OUTDIR / 'cached_data'
     cache.mkdir(parents=True, exist_ok=True)
     cfg = make_comparison_config(comparison_type, assessment or assessment_for(model))
     key = comparison_type.lower()
-    comp_path = cache / f"{model.lower()}_{index_name.lower()}_{key}.nc"
+    ftag = '' if freq == 'YS' else '_' + freq.lower().replace('-', '')
+    comp_path = cache / f"{model.lower()}_{index_name.lower()}_{key}{ftag}.nc"
     thr_path = cache / f"{model.lower()}_{index_name.lower()}_threshold.nc"
 
     info = INDEX_REGISTRY[index_name]
@@ -1649,7 +1870,8 @@ def run_comparison_cached(model, index_name, comparison_type,
             model, index_name, cfg,
             hilla_members=hilla_members, ssp245_members=ssp245_members,
             sai_members=sai_members,
-            precomputed_threshold=threshold, precomputed_baseline_data=None)
+            precomputed_threshold=threshold, precomputed_baseline_data=None,
+            freq=freq)
         save_result(res, comp_path)
         print(f"  Saved {comp_path.name}")
         if free_memory:
@@ -1678,7 +1900,7 @@ def save_nc_to_s3(obj, s3_path):
     finally:
         os.remove(tmp)
 
-
+'''
 def compute_annual_index_for_member(da, index_name, threshold, freq='YS'):
     """
     Annual index field (time, lat, lon) for one member, against a fixed
@@ -1690,21 +1912,63 @@ def compute_annual_index_for_member(da, index_name, threshold, freq='YS'):
     """
     info = INDEX_REGISTRY[index_name]
     _check_freq(index_name, freq)
-    kwargs = {info['variable']: da, info['threshold_kwarg']: threshold,
-              'freq': freq, **info['extra_kwargs']}
+    kwargs = {info['variable']: da, 'freq': freq, **info['extra_kwargs']}
+    if info['threshold_kwarg'] is not None:
+        kwargs[info['threshold_kwarg']] = threshold
     annual = info['xclim_fn'](**kwargs).squeeze(drop=True)
+    annual.name = index_name.upper()
+    return annual
+'''
+def compute_annual_index_for_member(da, index_name, threshold,
+                                    freq='YS', season=None, min_days=360):
+    """
+    Annual index field (time, lat, lon) for one member, against a fixed
+    baseline percentile. This is compute_index_for_members without the time mean,
+    so every year is kept and the file matches the fixed-index annual files. The
+    singleton 'percentiles' dim xclim attaches is squeezed so the field stacks
+    cleanly into (member, year, lat, lon).
+    
+    """
+    info = INDEX_REGISTRY[index_name]
+    _check_freq(index_name, freq, season)
+    kwargs = {info['variable']: da, 'freq': freq, **info['extra_kwargs']}
+    if info['threshold_kwarg'] is not None:
+        kwargs[info['threshold_kwarg']] = threshold
+    
+    annual = info['xclim_fn'](**kwargs).squeeze(drop=True)
+    # Mask bins the input does not fully cover. Without this a truncated final
+    # year enters the archive as a real year with a count low in proportion to
+    # its missing days: MIROC-ES2H G6-1.5K-HiLLA r02 stops 62 days into 2084 and
+    # UKESM1-1 G6-1.5K-HiLLA r3i1p1f2 has 270 of 360 days of pr in the same
+    # year. 360 accepts a complete year on the 360-day, noleap and Gregorian
+    # calendars present in this ensemble.
+    if freq == 'YS':
+        annual = annual.where(_complete_bins(da, 'YS', min_days=min_days))
+
+    elif freq == 'QS-DEC':
+        annual = annual.where(_complete_bins(da, 'QS-DEC',
+                                             min_days=SEASON_MIN_DAYS))
+        if season is not None:
+            annual = annual.sel(
+                time=annual['time'].dt.month == SEASON_STAMP[season])
+        
+        # A DJF bin is stamped with the December of the preceding year, so the
+        # year label on a DJF series is the year the winter starts, not the year
+        # holding January and February. Recorded in the attributes because the
+        # convention is invisible in the data and a reader will otherwise guess.
+        annual.attrs['season'] = season or 'all'
+        annual.attrs['season_year_convention'] = (
+            'bin stamped with its first month; a DJF value labelled YYYY covers '
+            'Dec YYYY, Jan YYYY+1, Feb YYYY+1')
+
     annual.name = index_name.upper()
     return annual
 
 
-def write_index_dataset(model, index_name,
-                        scenarios=('HiLLA', 'SSP245'),
-                        scenario_periods=None,
-                        members_by_scenario=None,
-                        ssp245_threshold_members=None,
-                        output_root=None,
-                        freq='YS',
-                        overwrite=False):
+def write_index_dataset(model, index_name, scenarios=('HiLLA', 'SSP245'),
+                        scenario_periods=None, members_by_scenario=None,
+                        ssp245_threshold_members=None, output_root=None,
+                        freq='YS', season=None, baseline_period=None, overwrite=False):
     """
     Compute one percentile index as per-member annual fields and write them to
         {output_root}/{model_label}/{scenario_label}/{member_label}/{INDEX}.nc
@@ -1715,10 +1979,15 @@ def write_index_dataset(model, index_name,
     peak memory is one member's daily record.
     
     """
-    _check_freq(index_name, freq)
+    _check_freq(index_name, freq, season)
     if output_root is None:
-        output_root = (ETCCDI_OUTPUT_ROOT if freq == 'YS'
-                       else ETCCDI_OUTPUT_ROOT.replace('_annual', '_monthly'))
+        if freq == 'YS':
+            output_root = ETCCDI_OUTPUT_ROOT
+        elif freq == 'MS':
+            output_root = ETCCDI_OUTPUT_ROOT.replace('_annual', '_monthly')
+        else:
+            suffix = (season or 'seasonal').lower()
+            output_root = ETCCDI_OUTPUT_ROOT.replace('_annual', f'_{suffix}')
 
     info = INDEX_REGISTRY[index_name]
     variable = info['variable']
@@ -1735,10 +2004,15 @@ def write_index_dataset(model, index_name,
 
     if ssp245_threshold_members is None:
         ssp245_threshold_members = get_layout(model, 'SSP245')['members']
+
+    if baseline_period is None:
+        baseline_period = BASELINE # unchanged default: 2020-2039
+        
     threshold, baseline_data = compute_baseline_threshold(
         model=model, variable=variable, percentile=info['percentile'],
-        baseline_period=BASELINE, members=ssp245_threshold_members,
+        baseline_period=baseline_period, members=ssp245_threshold_members,
         wet_day_thresh=info.get('wet_day_thresh'))
+    
     del baseline_data
     gc.collect()
 
@@ -1766,10 +2040,22 @@ def write_index_dataset(model, index_name,
             del ds
 
             annual = compute_annual_index_for_member(
-                da, index_name, threshold, freq=freq).load()
+                da, index_name, threshold, freq=freq, season=season).load()
             del da
             gc.collect()
 
+            annual.attrs.update({
+                'percentile_baseline_scenario': 'SSP2-4.5',
+                'percentile_baseline_period':
+                    f'{baseline_period.start_year}-{baseline_period.end_year}',
+                'percentile_baseline_years':
+                    baseline_period.end_year - baseline_period.start_year + 1,
+                'percentile_baseline_members':
+                    ','.join(str(m) for m in ssp245_threshold_members),
+                'percentile_method': 'xclim percentile_doy, 5-day centred '
+                                     'window, averaged across baseline members',
+            })
+            
             save_nc_to_s3(annual, s3_path)
             yrs = annual['time'].dt.year.values
             print(f'  wrote {model_label}/{scen_label}/{member_label}/{idx_file}  '
@@ -1780,6 +2066,8 @@ def write_index_dataset(model, index_name,
 
     print(f'Done {index_name.upper()} for {model_label}: {len(written)} files.')
     return written
+
+    
 # ============================================================================
 # SECTION 15  -  Plotting
 # ============================================================================
@@ -2170,29 +2458,58 @@ def contrast_table(contrast, regions=REGIONS, drop_e3sm_temp=True):
 # E3SM daily temperature is unusable (TREFHTMX == TREFHTMN == TREFHT at source),
 # so temperature indices run on three models and precipitation on four.
 TEMP_INDICES = {'TX90p', 'TX10p', 'TN90p', 'TN10p'}
-SPELL_INDICES = {'WSDI', 'CSDI'}   # spells cross month boundaries: annual only
-SUPPORTED_FREQ = ('YS', 'MS')      # annual and monthly output resolution
+SPELL_INDICES = {'WSDI', 'CSDI', 'GSL'}   # spells/seasons span months: annual only
+
+SUPPORTED_FREQ = ('YS', 'MS', 'QS-DEC')   # annual, monthly, seasonal
+# QS-DEC stamps each seasonal bin with the first month of the bin, so the stamp
+# month identifies the season. DJF is the only one that straddles a calendar
+# year, carrying the December of the preceding year.
+SEASON_STAMP = {'DJF': 12, 'MAM': 3, 'JJA': 6, 'SON': 9}
+SEASON_MIN_DAYS = 85      # every complete season is 90-92 days on every
+                          # calendar here; the largest partial stub is 59
 
 
-def _check_freq(index_name, freq):
-    """Validate an output frequency for an index.
+def _check_freq(index_name, freq, season=None):
+    """
+    Validate an output frequency for an index.
 
-    Only annual ('YS') and monthly ('MS') are supported. Spell-length indices
-    are annual-only: their spells can cross month boundaries, so a monthly
-    count is not the ETCCDI quantity.
+    Annual ('YS'), monthly ('MS') and seasonal ('QS-DEC') are supported.
+    Spell-length indices are annual-only: their spells can cross month 
+    boundaries, so a monthly count is not the ETCCDI quantity.
+    
     """
     if freq not in SUPPORTED_FREQ:
         raise ValueError(f'freq={freq!r} not supported; use one of '
                          f'{SUPPORTED_FREQ}')
+    
     if freq != 'YS' and index_name in SPELL_INDICES:
         raise ValueError(
             f'{index_name} is spell-based and only defined at annual frequency '
             f'(spells cross month boundaries); freq={freq!r} not supported')
-PRECIP_INDICES = {'R95p', 'R99p'}
+
+    if season is not None:
+        if freq != 'QS-DEC':
+            raise ValueError(f'season={season!r} applies only to '
+                             f"freq='QS-DEC', not {freq!r}")
+        if season not in SEASON_STAMP:
+            raise ValueError(f'season={season!r} unknown, use one of '
+                             f'{sorted(SEASON_STAMP)}')
+
+
+PRECIP_INDICES = {'R95p', 'R99p', 'RX1D', 'RX5D'}
 
 def MODELS_FOR(idx):
-    return (['CESM', 'UKESM', 'MIROC', 'E3SM'] if idx in PRECIP_INDICES
-            else ['CESM', 'UKESM', 'MIROC'])
+    """
+    Models valid for an index.
+
+    E3SM's daily maximum and minimum temperature are identical to its daily
+    mean at source, so only indices built on tasmax or tasmin lose E3SM.
+    Indices on precipitation or on daily-mean temperature (tas) keep all four.
+    
+    """
+    variable = INDEX_REGISTRY[idx]['variable']
+    return (['CESM', 'UKESM', 'MIROC'] if variable in ('tasmax', 'tasmin')
+            else ['CESM', 'UKESM', 'MIROC', 'E3SM'])
 
 
 # ============================================================================

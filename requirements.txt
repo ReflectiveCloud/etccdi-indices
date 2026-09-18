@@ -1,0 +1,12 @@
+xclim==0.54.0
+
+# xclim 0.54.0 calls xarray.core.ops.get_op, which newer xarray removed. On
+# xarray 2026.7.0 every percentile index fails at percentile_doy with
+# "module 'xarray.core' has no attribute 'ops'". Two ways out:
+#   - pin xarray to the version the Reflective hub image carries, which is the
+#     version every released file was built with; or
+#   - import xclim_compat and call patch(), which restores that one function.
+# No upper bound is pinned here because the exact xarray release that removed
+# the module has not been established, and guessing one would be worse than
+# saying so.
+xarray
