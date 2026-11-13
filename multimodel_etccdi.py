@@ -50,7 +50,17 @@ from xclim.indices import (days_over_precip_thresh, tx90p, tx10p, tn90p, tn10p,
                            warm_spell_duration_index, cold_spell_duration_index,
                            growing_season_length, growing_degree_days,
                            max_1day_precipitation_amount,
-                           max_n_day_precipitation_amount) # added fixed precipitation thresholds and GDD and GSL
+                           max_n_day_precipitation_amount,
+                           # The fourteen that were the shared notebooks' on
+                           # Derecho. Same functions and same thresholds as
+                           # make_shared_index_nbs.py uses, so the values are
+                           # comparable to the GLADE tree rather than merely
+                           # similar.
+                           tx_days_above, ice_days, tx_max, tx_min,
+                           frost_days, tn_days_above, tn_max, tn_min,
+                           prcptot, daily_pr_intensity, wetdays,
+                           maximum_consecutive_dry_days,
+                           maximum_consecutive_wet_days)
 
 
 import uuid
@@ -99,6 +109,13 @@ E3SM_MERGED_S3_PREFIX = ('s3://reflective-persistent-prod-large/'
 # Dataset (D2) output tree, etccdi-indices format. Defaults to your writable
 # area so a test writes nothing into Alistair's namespace. To merge into the
 # shared zarr, repoint this at his tree (with his OK) or sync the files across.
+# The pooled wet-day convention, from 30 September 2026. ETCCDI_indices_annual
+# beside this one is the earlier set, built from per-member-averaged percentiles
+# over all days, and the two are not comparable: measured on MIROC r01 and r02
+# over 30N to 60N, the R95p threshold is 10.38 mm/day under the old convention
+# and 15.71 under this one. etccdi_site.py says at length why they must not
+# share a tree. The suffix matches etccdi_site.OUTPUT_SUBDIR, which the Derecho
+# branch already uses, so both platforms' trees carry the same name.
 ETCCDI_OUTPUT_ROOT = ('s3://reflective-persistent-prod-large/'
                       'fafrifa/ETCCDI/ETCCDI_indices_annual')
 
@@ -178,11 +195,16 @@ ASSESSMENT = Period('assessment', 2065, 2084)
 # spin-up. Its window is therefore 15 years against 20, so its day-of-year
 # percentiles rest on 75 samples against 100. The gap is widest for R99p, where
 # only wet days enter the estimate.
+# Changed 14 October 2026 to SSP2-4.5 2020-2039 for every model, the period
+# whose mean GMSAT each G6-1.5K run targets (Lee et al. 2026, ACP 26, 7463).
+# Percentile indices are then exceedances of the climate SAI is meant to hold,
+# and all three models share one 20-year window. The MIROC 15-year discussion
+# above describes the 2015-2034 (MIROC 2020-2034) baseline used before then.
 BASELINE_BY_MODEL = {
-    'CESM':  Period('baseline', 2015, 2034),
-    'UKESM': Period('baseline', 2015, 2034),
-    'MIROC': Period('baseline', 2020, 2034),
-    'E3SM':  Period('baseline', 2015, 2034),
+    'CESM':  Period('baseline', 2020, 2039),
+    'UKESM': Period('baseline', 2020, 2039),
+    'MIROC': Period('baseline', 2020, 2039),
+    'E3SM':  Period('baseline', 2020, 2039),
 }
 
 # Per-model assessment window. CESM is 2050-2069 because its SSP245 members
@@ -339,8 +361,12 @@ MODEL_BUCKET_LAYOUT = {
  
     # ---- UKESM1-1 ------------------------------------------------------------
     # HiLLA (physics f2) splits variables across streams.
-    # SSP245 (physics f1) keeps the standard ap6/day/{var} layout; r2 excluded
-    # because it was uploaded non-CMORized (precipitation_flux / air_temperature_*).
+    # SSP245 now reads the UKESM1.1 het-chem-on reference staged under
+    # fafrifa/, through a custom reader; see the entry below. The ARISE-CMORized
+    # copies under UKESM1-1/SSP245/ are no longer used: two members rather than
+    # three, directory labels of f1 against files that say f2, and a CMOR
+    # source_id of UKESM1-0-LL that comes from the ARISE controlled vocabulary
+    # having no UKESM1-1-LL entry.
     ('UKESM', 'HiLLA'): {
         'path_template': 'UKESM1-1/G6-1p5K-HiLLA/{member}/{stream}/{var}',
         'members': ('r12i1p1f2', 'r2i1p1f2', 'r3i1p1f2'),
@@ -350,34 +376,86 @@ MODEL_BUCKET_LAYOUT = {
             'tasmax': 'apd/day',
             'tasmin': 'apd/day',
         },
+        # r3i1p1f2 in the shared tree stops before the end of 2084 (330 of
+        # 360 days of tasmax, tasmin and tas, 270 of pr). A complete copy of
+        # the same suite (u-ds286, GLADE member 003) was staged from GLADE to
+        # fafrifa/ on 30 October 2026 and is read first; the other members
+        # have no fafrifa directory and read the shared tree.
+        # (patch_hub_ukesm_hilla_r3_sources.py)
+        'sources': (
+            {'path_template': 'fafrifa/UKESM1-1/G6-1p5K-HiLLA/{member}/{stream}/{var}',
+             'file_pattern': ''},
+            {'path_template': 'UKESM1-1/G6-1p5K-HiLLA/{member}/{stream}/{var}',
+             'file_pattern': ''},
+        ),
     },
+    # UKESM1.1 SSP2-4.5, het-chem-on ensemble, staged from the JASMIN macloud
+    # share into fafrifa/UKESM1-1/SSP245/ on 1 October 2026. Three members
+    # against three scenario members, at the model version and chemistry
+    # configuration the G6-1.5K-SAI runs were made with.
+    #
+    # This replaces an entry that read the ARISE-CMORized copies:
+    #     'path_template': 'UKESM1-1/SSP245/{member}/ap6/day/{var}',
+    #     'members': ('r12i1p1f1', 'r3i1p1f1'),
+    # Two members rather than three, out of a tree whose CMOR source_id says
+    # UKESM1-0-LL. That label is a controlled-vocabulary artifact: those files
+    # carry cv_version 'ARISE v0.1', which has no UKESM1-1-LL entry, and their
+    # mo_runid names these same u-dp90x suites. The runs are UKESM1.1 either
+    # way, so this is a change of member count and of naming, not of model
+    # version.
     ('UKESM', 'SSP245'): {
-        'path_template': 'UKESM1-1/SSP245/{member}/ap6/day/{var}',
-        'members': ('r12i1p1f1', 'r3i1p1f1'),
-        'file_pattern': '',
-        'streams': None,
+        'path_template': '', 'members': ('u-dp902', 'u-dp903', 'u-dp904'),
+        'file_pattern': '', 'streams': None,
+        'custom_reader': 'ukesm11_ssp245',
     },
  
     # ---- MIROC-ES2H ----------------------------------------------------------
     # Both scenarios in one flat directory, split by filename.
     ('MIROC', 'HiLLA'): {
         'path_template': 'MIROC-ES2H/G6-1.5K-HiLLA/day',
-        'members': ('r01', 'r02', 'r03'),
+        'members': ('r01', 'r02', 'r03', 'r04', 'r05', 'r06', 'r07', 'r08',
+                    'r09', 'r10'),
         'file_pattern': '{var}_G6-1.5K-HiLLA_{member}.nc',
         'streams': None,
+        'sources': (
+            {'path_template': 'MIROC-ES2H/G6-1.5K-HiLLA/day',
+             'file_pattern': '{var}_G6-1.5K-HiLLA_{member}.nc'},
+            {'path_template': 'fafrifa/MIROC-ES2H/G6-1.5K-HiLLA/day',
+             'file_pattern': '{var}_G6-1.5K-HiLLA_{member}.nc'},
+        ),
     },
+    # SSP2-4.5 is read from the G6-1.5K-HiLLA directory on purpose: the
+    # shared bucket keeps the MIROC SSP2-4.5 files there, named
+    # <var>_baseline_<member>.nc, beside the HiLLA files. Members the
+    # shared tree lacks were staged from GLADE to fafrifa/MIROC-ES2H/
+    # SSP2-4.5/day (second source). Hub builds agree with the GLADE tree
+    # (24-29 October 2026). (patch_hub_miroc_layout_comment.py)
     ('MIROC', 'SSP245'): {
         'path_template': 'MIROC-ES2H/G6-1.5K-HiLLA/day',
-        'members': ('r01', 'r02', 'r03'),
+        'members': ('r01', 'r02', 'r03', 'r04', 'r05', 'r06', 'r07', 'r08',
+                    'r09', 'r10'),
         'file_pattern': '{var}_baseline_{member}.nc',
         'streams': None,
+        'sources': (
+            {'path_template': 'MIROC-ES2H/G6-1.5K-HiLLA/day',
+             'file_pattern': '{var}_baseline_{member}.nc'},
+            {'path_template': 'fafrifa/MIROC-ES2H/SSP2-4.5/day',
+             'file_pattern': '{var}_baseline_{member}.nc'},
+        ),
     },
 
     ('MIROC', 'SAI'): {
         'path_template': 'MIROC-ES2H/G6-1.5K-SAI/day',
-        'members': ('r01', 'r02', 'r03'),
+        'members': ('r01', 'r02', 'r03', 'r04', 'r05', 'r06', 'r07', 'r08',
+                    'r09', 'r10'),
         'file_pattern': '{var}_G6-1.5K-SAI_{member}.nc',
         'streams': None,
+        'sources': (
+            {'path_template': 'MIROC-ES2H/G6-1.5K-SAI/day',
+             'file_pattern': '{var}_G6-1.5K-SAI_{member}.nc'},
+            {'path_template': 'fafrifa/MIROC-ES2H/G6-1.5K-SAI/day',
+             'file_pattern': '{var}_G6-1.5K-SAI_{member}.nc'},
+        ),
     },
  
     # ---- E3SMv3 --------------------------------------------------------------
@@ -404,7 +482,7 @@ MODEL_BUCKET_LAYOUT = {
 
     ('UKESM', 'SAI'): {
         'path_template': '', 'members': ('001', '002', '003'),
-        'file_pattern': '', 'streams': None, 'custom_reader': 'ukesm_sai',
+        'file_pattern': '', 'streams': None, 'custom_reader': 'ukesm11_sai',
     },
     ('E3SM', 'SAI'): {
         'path_template': '', 'members': ('001', '002', '003'),
@@ -431,8 +509,8 @@ MODEL_LABEL = {
 }
 SCENARIO_LABEL = {
     ('CESM', 'HiLLA'): 'G6-1.5K-HiLLA',  ('CESM', 'SAI'): 'G6-1.5K-SAI', ('CESM', 'SSP245'): 'SSP2-4.5',
-    ('UKESM', 'HiLLA'): 'G6-1.5K-HiLLA', ('UKESM', 'SSP245'): 'SSP245',
-    ('MIROC', 'HiLLA'): 'G6-1.5K-HiLLA', ('MIROC', 'SSP245'): 'baseline',
+    ('UKESM', 'HiLLA'): 'G6-1.5K-HiLLA', ('UKESM', 'SSP245'): 'SSP2-4.5',
+    ('MIROC', 'HiLLA'): 'G6-1.5K-HiLLA', ('MIROC', 'SSP245'): 'SSP2-4.5',
     ('MIROC', 'SAI'): 'G6-1.5K-SAI', 
     ('E3SM', 'HiLLA'): 'G6-1.5K-HiLLA',  ('E3SM', 'SSP245'): 'SSP245',
     ('UKESM', 'SAI'): 'G6-1.5K-SAI',   ('E3SM', 'SAI'): 'G6-1.5K-SAI',   # SCENARIO_LABEL
@@ -443,7 +521,13 @@ MEMBER_LABEL = {
     ('CESM', 'SAI'): {'r1': 'r1', 'r2': 'r2', 'r3': 'r3'},
     ('CESM', 'SSP245'):  {'r6': 'r6', 'r7': 'r7', 'r8': 'r8', 'r9': 'r9', 'r10': 'r10'},
     ('UKESM', 'HiLLA'):  {'r12i1p1f2': 'r1', 'r2i1p1f2': 'r2', 'r3i1p1f2': 'r3'},
-    ('UKESM', 'SSP245'): {'r12i1p1f1': 'r1', 'r3i1p1f1': 'r3'},   # provisional, see note
+    # Realisation numbers confirmed by Alistair Duffey on 25 September 2026:
+    # u-dp902 is r2, u-dp903 is r3, u-dp904 is r12. Written as r12, as
+    # derecho_layout.OUT_LABEL writes it (decided 2 October 2026), while
+    # HiLLA writes its r12i1p1f2 as r1. Realisation 12 therefore carries
+    # different labels in SSP2-4.5 and HiLLA; pair members by realisation,
+    # not by label.
+    ('UKESM', 'SSP245'): {'u-dp904': 'r12', 'u-dp902': 'r2', 'u-dp903': 'r3'},
     ('MIROC', 'HiLLA'):  {'r01': 'r01', 'r02': 'r02', 'r03': 'r03'},
     ('MIROC', 'SSP245'): {'r01': 'r01', 'r02': 'r02', 'r03': 'r03'},
     ('MIROC', 'SAI'): {'r01': 'r01', 'r02': 'r02', 'r03': 'r03'},
@@ -456,6 +540,15 @@ MEMBER_LABEL = {
     ('UKESM', 'SAI'): {'001': 'r1', '002': 'r2', '003': 'r3'},           # MEMBER_LABEL
     ('E3SM',  'SAI'): {'001': 'r1', '002': 'r2', '003': 'r3'},           # MEMBER_LABEL
 }
+
+# UKESM1-0-LL SSP2-4.5, the older reference staged on GLADE and kept there for
+# the version-sensitivity comparison (derecho_layout 'UKESM10'). Labels only:
+# it has no bucket layout. Restored 28 October 2026 so this module can replace
+# the 30 September copy on Derecho, whose build_indices_derecho.py indexes
+# these tables for --model UKESM10 (patch_hub_ukesm10_labels.py).
+MODEL_LABEL['UKESM10'] = 'UKESM1-0-LL'
+SCENARIO_LABEL[('UKESM10', 'SSP245')] = 'SSP2-4.5'
+MEMBER_LABEL[('UKESM10', 'SSP245')] = {'r1': 'r1', 'r2': 'r2', 'r3': 'r3'}
 
 
 # ============================================================================
@@ -553,7 +646,24 @@ def get_variable_info(model, variable):
 # ============================================================================
 # ---- SAI sources on Alistair's bucket (different layouts per model) ----
 UKESM_SAI_S3_BASE = 's3://reflective-persistent-prod/alistairduffey/UKESM1-1/G6-1.5K-SAI/'
-UKESM_SAI_VARMAP  = {'tasmax': 'temp', 'tasmin': 'temp_1', 'pr': 'precip'}
+UKESM_SAI_VARMAP  = {
+    'tasmax': 'temp',
+    'tasmin': 'temp_1',
+    'pr': 'precip',
+    # Daily mean temperature. The archive's own metadata does not say so:
+    # these Unified Model copies carry no cell_methods, and temp, temp_1 and
+    # temp_2 all share long_name 'Temperature T' and standard_name
+    # 'air_temperature'. Identified on 3 October 2026 from two things. The
+    # valid_min and valid_max of temp_2 are bracketed by those of temp_1 and
+    # temp at both ends, which only a within-day statistic can be, and
+    # UKESM11_SSP245_VARMAP already maps the same positional order on the
+    # CMORized files: unsuffixed is tasmax, the first suffix tasmin, the next
+    # one tas. A pointwise test over one year of member 001 confirmed
+    # temp_1 <= temp_2 <= temp everywhere before this line was written; see
+    # patch_hub_ukesm_sai_tas.py. Worth confirming with Alistair Duffey, who
+    # made the copies.
+    'tas': 'temp_2',
+}
 
 E3SM_SAI_S3_BASE = 's3://reflective-persistent-prod/alistairduffey/E3SMv3/G6-1.5K-SAI/'
 E3SM_SAI_VARMAP  = {'tasmax': ('daily_T_max', 'TREFHTMX'),
@@ -717,7 +827,7 @@ def read_e3sm_var(case_name, var, period, scenario_dir='G6-1.5K-HiLLA'):
             print(f"  {case_name}/{var} {period.start_year}-{period.end_year}: "
                   f"streaming merged file from bucket")
             with fsspec.open(merged_uri, mode='rb') as fobj:
-                return open_netcdf_any(fobj).load()
+                return _cut_lat_band(open_netcdf_any(fobj)).load()
     except Exception as e:  # noqa: BLE001 - fall through to rebuild on any error
         print(f"  (bucket check/stream failed: {type(e).__name__}; rebuilding)")
  
@@ -807,15 +917,195 @@ def read_e3sm_var(case_name, var, period, scenario_dir='G6-1.5K-HiLLA'):
         shutil.rmtree(tmp_dir, ignore_errors=True)
  
 
+# netCDF3 by byte range, with no dependency beyond numpy, fsspec and xarray.
+# Added 26 October 2026 (patch_hub_ukesm_sai_nc3.py) for Alistair Duffey's
+# UKESM1-1 G6-1.5K-SAI files: 6.09 GB each, three temperatures, against a
+# 7.8 GB pod and a home quota too small to copy them. scipy, the only netCDF3
+# reader that takes a file object, reads every variable at open; kerchunk 0.2.7
+# on the Hub does not work with its zarr 3.0.1. The format is the published
+# one (NetCDF Classic and 64-bit Offset Format, CDF-1, CDF-2, CDF-5); decoding
+# is xarray's own decode_cf, the step open_dataset applies after reading.
+_NC3_TYPES = {1: 'i1', 2: 'S1', 3: '>i2', 4: '>i4', 5: '>f4', 6: '>f8',
+              7: 'u1', 8: '>u2', 9: '>u4', 10: '>i8', 11: '>u8'}
+_NC3_HEADERS = {}
+
+
+def _nc3_header(fobj):
+    """
+    (dims, global attrs, variables, numrecs, recsize) from a netCDF3 file
+    object positioned at 0. Reads the header only.
+    """
+    def rd(n):
+        b = fobj.read(n)
+        if len(b) != n:
+            raise ValueError('netCDF3 header truncated')
+        return b
+
+    magic = rd(4)
+    if magic[:3] != b'CDF' or magic[3] not in (1, 2, 5):
+        raise ValueError(f'not a netCDF3 file (magic {magic!r})')
+    ver = magic[3]
+
+    def i4():
+        return int(np.frombuffer(rd(4), '>i4')[0])
+
+    def i8():
+        return int(np.frombuffer(rd(8), '>i8')[0])
+
+    count = i8 if ver == 5 else i4
+    numrecs = i8() if ver == 5 else int(np.frombuffer(rd(4), '>u4')[0])
+    if numrecs in (0xFFFFFFFF, -1):
+        raise ValueError('streaming netCDF3 (numrecs unset) is not supported')
+
+    def name():
+        n = count()
+        s = rd(n).decode('utf-8')
+        rd((-n) % 4)
+        return s
+
+    def attrs():
+        tag, n = i4(), count()
+        out = {}
+        for _ in range(n if tag else 0):
+            k, t, m = name(), i4(), count()
+            dt = np.dtype(_NC3_TYPES[t])
+            nb = m * dt.itemsize
+            raw = rd(nb)
+            rd((-nb) % 4)
+            if t == 2:
+                out[k] = raw.decode('utf-8', 'replace').rstrip('\x00')
+            else:
+                v = np.frombuffer(raw, dt).astype(dt.newbyteorder('='))
+                out[k] = v[0] if m == 1 else v
+        return out
+
+    tag, n = i4(), count()
+    dims = [(name(), count()) for _ in range(n if tag else 0)]
+    gattrs = attrs()
+    tag, n = i4(), count()
+    variables = {}
+    for _ in range(n if tag else 0):
+        vn = name()
+        ids = [count() for _ in range(count())]
+        va = attrs()
+        dt = np.dtype(_NC3_TYPES[i4()])
+        count()                                   # vsize: recomputed below
+        begin = i8() if ver in (2, 5) else int(np.frombuffer(rd(4), '>u4')[0])
+        rec = bool(ids) and dims[ids[0]][1] == 0
+        variables[vn] = dict(dims=[dims[i][0] for i in ids],
+                             shape=[numrecs if (k == 0 and rec) else dims[i][1]
+                                    for k, i in enumerate(ids)],
+                             dtype=dt, attrs=va, begin=begin, record=rec)
+    rec = [v for v in variables.values() if v['record']]
+    sizes = [v['dtype'].itemsize * int(np.prod(v['shape'][1:], dtype='int64'))
+             for v in rec]
+    # One record variable: no padding between records (the format's special
+    # case). Otherwise each record slab is padded to four bytes.
+    recsize = sizes[0] if len(rec) == 1 else sum(s + (-s) % 4 for s in sizes)
+    return dims, gattrs, variables, numrecs, recsize
+
+
+def _nc3_read(fs, rpath, v, recsize, i0=None, i1=None, block_bytes=64 * 2**20):
+    """
+    Raw values of one variable along its first dimension, [i0, i1), in
+    native byte order. Fixed variables are one contiguous range, fetched in
+    blocks; record variables are one range per record, fetched in batches.
+    """
+    shape, dt = list(v['shape']), v['dtype']
+    lead = shape[0] if shape else 1
+    row = dt.itemsize * int(np.prod(shape[1:], dtype='int64')) if shape else dt.itemsize
+    i0 = 0 if i0 is None else i0
+    i1 = lead if i1 is None else i1
+    buf = np.empty((i1 - i0) * row, dtype='u1')
+    if v['record']:
+        starts = [v['begin'] + r * recsize for r in range(i0, i1)]
+        per = max(1, block_bytes // max(row, 1))
+        for j in range(0, len(starts), per):
+            s = starts[j:j + per]
+            got = fs.cat_ranges([rpath] * len(s), s, [x + row for x in s])
+            buf[j * row:(j + len(s)) * row] = np.frombuffer(b''.join(got), 'u1')
+    else:
+        a, b = v['begin'] + i0 * row, v['begin'] + i1 * row
+        pos = a
+        while pos < b:
+            e = min(b, pos + block_bytes)
+            buf[pos - a:e - a] = np.frombuffer(
+                fs.cat_file(rpath, start=pos, end=e), 'u1')
+            pos = e
+    arr = buf.view(dt).reshape(([i1 - i0] + shape[1:]) if shape else ())
+    if dt.byteorder == '>' and np.little_endian:
+        arr = arr.byteswap(inplace=True).view(dt.newbyteorder('<'))
+    return arr
+
+
+def _read_netcdf3_window(url, var, tdim, span):
+    """
+    One variable of a netCDF3 file for the years span=(first, last), as a
+    decoded xarray Dataset with its coordinates. Only the header, the
+    coordinates and the window of that variable are fetched.
+    """
+    fs, rpath = fsspec.core.url_to_fs(url)
+    if not fs.exists(rpath):
+        raise FileNotFoundError(url)
+    hdr = _NC3_HEADERS.get(url)
+    if hdr is None:
+        with fs.open(rpath, 'rb', block_size=2**20) as f:
+            hdr = _nc3_header(f)
+        _NC3_HEADERS[url] = hdr
+    dims, gattrs, V, numrecs, recsize = hdr
+    v = V[var]
+    if not v['dims'] or v['dims'][0] != tdim:
+        raise ValueError(f'{var} does not lead with {tdim}: {v["dims"]}')
+
+    traw = _nc3_read(fs, rpath, V[tdim], recsize)
+    # Decoded once, here, and attached already decoded below: decode_cf
+    # cannot decode an empty time axis, which a window outside the record
+    # gives, and the reader's own "no data" test needs that case to return.
+    tdec = xr.decode_cf(xr.Dataset(coords={tdim: xr.Variable(
+        (tdim,), traw, dict(V[tdim]['attrs']))}))[tdim].variable
+    pos = xr.DataArray(np.arange(traw.shape[0]), dims=tdim,
+                       coords={tdim: tdec}).sel({tdim: slice(*span)}).values
+    i0, i1 = (int(pos[0]), int(pos[-1]) + 1) if pos.size else (0, 0)
+    if pos.size and pos.size != i1 - i0:
+        raise ValueError(f'{tdim} is not monotonic in {url}')
+
+    coords = {}
+    want = list(v['dims']) + str(v['attrs'].get('coordinates', '')).split()
+    for c in dict.fromkeys(want):
+        if c not in V or c == var:
+            continue
+        cv = V[c]
+        if c == tdim:
+            coords[c] = tdec[i0:i1]
+            continue
+        if cv['dims'] and cv['dims'][0] == tdim:
+            data = _nc3_read(fs, rpath, cv, recsize, i0, i1)
+        else:
+            data = _nc3_read(fs, rpath, cv, recsize)
+        coords[c] = xr.Variable(cv['dims'], data, dict(cv['attrs']))
+    data = _nc3_read(fs, rpath, v, recsize, i0, i1)
+    ds = xr.Dataset({var: xr.Variable(v['dims'], data, dict(v['attrs']))},
+                    coords=coords, attrs=dict(gattrs))
+    return xr.decode_cf(ds)
+
+
+# Not used since 27 October 2026: MODEL_BUCKET_LAYOUT[('UKESM', 'SAI')] now
+# reads the het-chem-on suites through read_ukesm11_sai_var. These copies
+# (alistairduffey/UKESM1-1/G6-1.5K-SAI) are other G6-1.5K-SAI realisations,
+# most likely the het-chem-off u-di189, u-di864, u-di865 (unconfirmed).
+# Kept so that results made with them can be reproduced.
 def read_ukesm_sai_var(member_num, variable, period):
     """
     UKESM1-1 G6-1.5K-SAI: Alistair's scipy single-file copies, one file per
     member holding temp (tasmax), temp_1 (tasmin), precip (pr, m/s) on dims t/ht
     or t/surface with latitude/longitude coords.
 
-    Opened lazily with dask chunks so only the requested variable and window are
-    read (the files hold both temperatures over the full run; loading that eagerly
-    overruns memory). Normalised to a standard UKESM Dataset: t->time,
+    Read by byte range (_read_netcdf3_window), so only the header, the
+    coordinates and the requested variable over the requested window are
+    fetched from S3, and nothing is written to disk. Before 26 October 2026
+    the file was opened through an fsspec file object with engine='scipy',
+    which reads every variable at open: three full-grid temperatures,
+    6.09 GB, against a 7.8 GB pod. Normalised to a standard UKESM Dataset: t->time,
     latitude/longitude->lat/lon cast float64 to match the CMORized HiLLA grid,
     singleton squeezed, precip->mm/day, CMOR variable name.
     
@@ -826,8 +1116,7 @@ def read_ukesm_sai_var(member_num, variable, period):
     path = f'{UKESM_SAI_S3_BASE}{sub}/{prefix}_{member_num}.nc'
     span = (str(period.start_year), str(period.end_year))
     try:
-        with fsspec.open(path, mode='rb') as fobj:
-            ds = xr.open_dataset(fobj, engine='scipy', chunks={'t': 360})
+        with _read_netcdf3_window(path, src, 't', span) as ds:
             rename = {'t': 'time'}
             if 'latitude' in ds.coords or 'latitude' in ds.dims:
                 rename['latitude'] = 'lat'
@@ -837,7 +1126,9 @@ def read_ukesm_sai_var(member_num, variable, period):
             for singleton in ('ht', 'surface'):
                 if singleton in ds.dims:
                     ds = ds.squeeze(singleton, drop=True)
-            da = ds[src].sel(time=slice(*span)).load()   # only this var + window
+            # The window was applied while reading; a date .sel here would
+            # fail on the empty time axis a window outside the record gives.
+            da = ds[src].load()
     except FileNotFoundError:
         print(f"  UKESM SAI not found: {path}")
         return None
@@ -966,6 +1257,237 @@ def list_e3sm_merged_on_bucket():
 # ============================================================================
 # SECTION 7  -  Generic per-variable reader (dispatches E3SM to its reader)
 # ============================================================================
+# ---------------------------------------------------------------------------
+# UKESM1.1 SSP2-4.5, the het-chem-on reference
+# ---------------------------------------------------------------------------
+# Suites u-dp902 (r2), u-dp903 (r3), u-dp904 (r12), Andy Jones, UKESM1.1,
+# UM 13.1, stratospheric heterogeneous chemistry ON, per the UKESM runs
+# spreadsheet. Staged from the JASMIN macloud share into this namespace on
+# 1 October 2026.
+#
+# These are the matching reference for G6-1.5K-SAI, which is u-dp583 (r2),
+# u-dp690 (r3) and u-dp691 (r12), also het chem ON. A parallel het-chem-OFF
+# SSP2-4.5 ensemble exists (u-dh561, u-di183, u-di184) and pairing across the
+# two would compare a chemistry configuration as well as a forcing.
+UKESM11_SSP245_S3_BASE = ('s3://reflective-persistent-prod-large/'
+                          'fafrifa/UKESM1-1/SSP245/')
+
+# Which internal name is which. These files hold three temperature fields whose
+# names say nothing about which is which, and getting it backwards would
+# silently invert every cold-extreme index. Established by the pointwise
+# ordering test in probe_bucket_member.py on two timesteps in different
+# seasons, and agreed with cell_methods on all three.
+UKESM11_SSP245_VARMAP = {'tas':    'air_temperature_1',
+                         'tasmin': 'air_temperature_0',
+                         'tasmax': 'air_temperature',
+                         'pr':     'precipitation_flux'}
+
+# One file holds the three temperatures, another the precipitation.
+_U11_TAS = 'tas_mean_min_max_day_UKESM1-1-LL_SSP245_{member}_201501-210012.nc'
+UKESM11_SSP245_FILE = {'tas': _U11_TAS, 'tasmin': _U11_TAS,
+                       'tasmax': _U11_TAS,
+                       'pr': 'pr_day_UKESM1-1-LL_SSP245_{member}_'
+                             '201501-210012.nc'}
+
+
+def read_ukesm11_ssp245_var(member, variable, period):
+    """
+    UKESM1.1 SSP2-4.5 reference, raw Met Office output staged from JASMIN.
+
+    Opened lazily with dask chunks, then the requested variable and window are
+    selected before anything is loaded. The temperature file is 9.57 GiB and
+    holds the full 2015-2100 record of all three fields, so the eager
+    open_dataset().load() that read_model_var uses would pull nine times what a
+    20-year baseline of one variable needs, and load_scenario_members loops
+    over members.
+
+    Normalised to what the registered converters expect: latitude/longitude
+    renamed to lat/lon and cast to float64 to match the CMORized HiLLA grid,
+    and the internal variable renamed to its CMIP name. Units are left alone,
+    so _convert_cmip_pr applies the kg m-2 s-1 to mm/day factor exactly as it
+    does for the CMOR members rather than this reader doing it differently.
+
+    Returns a one-variable Dataset, or None if the file is absent or holds
+    nothing in the window.
+    """
+    if variable not in UKESM11_SSP245_VARMAP:
+        raise KeyError(
+            f'UKESM1.1 SSP2-4.5 has no mapping for {variable!r}; known: '
+            f'{sorted(UKESM11_SSP245_VARMAP)}. Do not guess an internal name '
+            f'for this source: the three temperature fields are called '
+            f'air_temperature, air_temperature_0 and air_temperature_1 and '
+            f'the names do not say which is which.')
+    src = UKESM11_SSP245_VARMAP[variable]
+    path = (UKESM11_SSP245_S3_BASE + f'{member}/'
+            + UKESM11_SSP245_FILE[variable].format(member=member))
+    span = (str(period.start_year), str(period.end_year))
+
+    try:
+        with fsspec.open(path, mode='rb') as fobj:
+            ds = xr.open_dataset(fobj, engine='h5netcdf',
+                                 chunks={'time': 360})
+            rename = {}
+            if 'latitude' in ds.dims or 'latitude' in ds.coords:
+                rename['latitude'] = 'lat'
+            if 'longitude' in ds.dims or 'longitude' in ds.coords:
+                rename['longitude'] = 'lon'
+            if rename:
+                ds = ds.rename(rename)
+            if src not in ds:
+                raise KeyError(
+                    f'{src!r} not in {path}. Found {sorted(ds.data_vars)}. '
+                    f'Re-run probe_bucket_member.py on this member rather '
+                    f'than editing UKESM11_SSP245_VARMAP to whatever is '
+                    f'there: the ordering test is what establishes the '
+                    f'mapping.')
+            da = _cut_lat_band(ds[src].sel(time=slice(*span))).load()
+    except FileNotFoundError:
+        print(f"  UKESM1.1 SSP2-4.5 not found: {path}")
+        return None
+
+    if len(da.time) == 0:
+        print(f"  UKESM1.1 SSP2-4.5 {member}/{variable}: nothing in "
+              f"{span[0]}-{span[1]}")
+        return None
+    da = da.assign_coords(lat=da['lat'].astype('float64'),
+                          lon=da['lon'].astype('float64'))
+    print(f"  UKESM/SSP245/{member}/{variable}: {len(da.time)} steps from "
+          f"{src}")
+    return da.rename(variable).to_dataset()
+
+
+# ---------------------------------------------------------------------------
+# UKESM1.1 G6-1.5K-SAI, the het-chem-on suites (since 27 October 2026)
+# ---------------------------------------------------------------------------
+# u-dp691 (r12), u-dp583 (r2), u-dp690 (r3), Andy Jones, UM 13.1,
+# stratospheric heterogeneous chemistry ON: the SAI arm that matches the
+# SSP2-4.5 reference above. Raw Met Office daily output, one file of three
+# temperatures and one of precipitation per suite, 2034-01-01 to 2084-12-30.
+# Member ids 001, 002, 003 follow GLADE's directories, which hold these suites
+# in this order (tasmax fingerprints, 26 October 2026), so the Hub and Derecho
+# write the same member labels.
+UKESM11_SAI_S3_BASE = 's3://reflective-persistent-prod-large/UKESM1-1/G6-1.5K-SAI/'
+UKESM11_SAI_SUITE = {'001': ('r12i1p1f2', 'u-dp691'),
+                     '002': ('r2i1p1f2', 'u-dp583'),
+                     '003': ('r3i1p1f2', 'u-dp690')}
+_U11S_TAS = 'day/tas/tas_day_UKESM1-1-LL_{suite}_201501-210012.nc'
+UKESM11_SAI_FILE = {'tas': _U11S_TAS, 'tasmin': _U11S_TAS, 'tasmax': _U11S_TAS,
+                    'pr': 'day/pr/pr_day_UKESM1-1-LL_{suite}_201501-210012.nc'}
+
+
+def read_ukesm11_sai_var(member, variable, period):
+    """
+    UKESM1.1 G6-1.5K-SAI, het-chem-on suites, read as read_ukesm11_ssp245_var
+    reads the reference: lazily with dask chunks, the requested variable and
+    window selected before anything is loaded, latitude/longitude renamed to
+    lat/lon as float64, units left for the registered converter. Internal
+    names from UKESM11_SSP245_VARMAP, established by the ordering test.
+
+    Returns a one-variable Dataset, or None if the file is absent or holds
+    nothing in the window.
+    """
+    if member not in UKESM11_SAI_SUITE:
+        raise KeyError(f'UKESM SAI member {member!r} unknown; known: '
+                       f'{sorted(UKESM11_SAI_SUITE)}')
+    if variable not in UKESM11_SSP245_VARMAP:
+        raise KeyError(f'UKESM1.1 G6-1.5K-SAI has no mapping for {variable!r}; '
+                       f'known: {sorted(UKESM11_SSP245_VARMAP)}')
+    variant, suite = UKESM11_SAI_SUITE[member]
+    src = UKESM11_SSP245_VARMAP[variable]
+    path = (UKESM11_SAI_S3_BASE + f'{variant}/'
+            + UKESM11_SAI_FILE[variable].format(suite=suite))
+    span = (str(period.start_year), str(period.end_year))
+    try:
+        with fsspec.open(path, mode='rb') as fobj:
+            ds = xr.open_dataset(fobj, engine='h5netcdf', chunks={'time': 360})
+            rename = {}
+            if 'latitude' in ds.dims or 'latitude' in ds.coords:
+                rename['latitude'] = 'lat'
+            if 'longitude' in ds.dims or 'longitude' in ds.coords:
+                rename['longitude'] = 'lon'
+            if rename:
+                ds = ds.rename(rename)
+            if src not in ds:
+                raise KeyError(f'{src!r} not in {path}. Found '
+                               f'{sorted(ds.data_vars)}.')
+            da = _cut_lat_band(ds[src].sel(time=slice(*span))).load()
+    except FileNotFoundError:
+        print(f"  UKESM1.1 G6-1.5K-SAI not found: {path}")
+        return None
+    if len(da.time) == 0:
+        print(f"  UKESM1.1 G6-1.5K-SAI {member}/{variable}: nothing in "
+              f"{span[0]}-{span[1]}")
+        return None
+    da = da.assign_coords(lat=da['lat'].astype('float64'),
+                          lon=da['lon'].astype('float64'))
+    print(f"  UKESM/SAI/{member} ({suite})/{variable}: {len(da.time)} steps "
+          f"from {src}")
+    return da.rename(variable).to_dataset()
+
+
+def _fix_cesm_time(ds):
+    """
+    Replace time with the bounds midpoint. No-op if bounds are absent.
+
+    Ported verbatim from derecho_io._fix_cesm_time on 2 October 2026 so the
+    two readers can be diffed. CAM writes end-of-interval timestamps, so
+    without this every CESM record sits one day late and the day-of-year
+    percentile is built on the wrong days.
+    """
+    bname = next((b for b in ['time_bnds', 'time_bounds'] if b in ds), None)
+    if bname is None:
+        print('    WARNING: CESM file has no time bounds; leaving time as '
+              'found. Check whether it is end-stamped before trusting the '
+              'window.')
+        return ds
+    b = ds[bname].values
+    width = b[:, 1] - b[:, 0]
+    mid = b[:, 0] + width / 2
+
+    # Drop zero-width bins. The first record of a CAM run carries
+    # time_bnds = [start, start], a bin covering no time at all: it is the
+    # model state written at initialisation, not a day of output. Its midpoint
+    # lands at the run start, 2015-01-01 00:00 for CESM SSP2-4.5, twelve hours
+    # before the genuine 1 January record at 12:00. The two are distinct
+    # timestamps, so de-duplication does not remove it, and the year gains a
+    # 366th day on a noleap calendar. It shows up only in a window that
+    # includes the first year of the run, which is why 2020-2039 is clean and
+    # 2015-2034, the new baseline window, is not.
+    keep = width != (width * 0)
+    n_drop = int((~keep).sum())
+    if n_drop:
+        print(f'    dropping {n_drop} zero-width bin(s) at '
+              f'{[str(x) for x in mid[~keep]]}')
+        ds = ds.isel(time=np.flatnonzero(keep))
+        mid = mid[keep]
+    return ds.assign_coords(time=('time', mid))
+
+
+# Optional latitude band for the readers, (lo, hi) in degrees, or None for the
+# whole grid. Set by build_indices_hub_boot.py from --lat-range so a member is
+# cut before it is loaded; the pod has 7.8 GB. Added 27 October 2026.
+READ_LAT_RANGE = None
+
+
+def _cut_lat_band(ds):
+    """
+    ds restricted to READ_LAT_RANGE by latitude value, lazily, or ds
+    unchanged when the setting is None or ds has no latitude axis.
+    """
+    if READ_LAT_RANGE is None:
+        return ds
+    name = next((c for c in ('lat', 'latitude') if c in ds.dims), None)
+    if name is None:
+        return ds
+    lo, hi = READ_LAT_RANGE
+    v = np.asarray(ds[name].values, dtype='float64')
+    idx = np.flatnonzero((v >= lo) & (v <= hi))
+    if idx.size == 0:
+        raise ValueError(f'no latitude in [{lo}, {hi}]; the grid runs '
+                         f'{v.min():.2f} to {v.max():.2f}')
+    return ds.isel({name: slice(int(idx.min()), int(idx.max()) + 1)})
+
+
 def read_model_var(model, scenario, member, variable, period):
     """
     Read one variable for one (model, scenario, member) over a time window.
@@ -985,46 +1507,87 @@ def read_model_var(model, scenario, member, variable, period):
     if cr == 'e3sm':
         return read_e3sm_var(case_name=member, var=native_var,
                              period=period, scenario_dir='G6-1.5K-HiLLA')
+    if cr == 'ukesm11_sai':
+        return read_ukesm11_sai_var(member=member, variable=variable,
+                                    period=period)
     if cr == 'ukesm_sai':
         return read_ukesm_sai_var(member_num=member, variable=variable, period=period)
     if cr == 'e3sm_sai':
         return read_e3sm_sai_var(member_num=member, variable=variable, period=period)
+    if cr == 'ukesm11_ssp245':
+        return read_ukesm11_ssp245_var(member=member, variable=variable,
+                                       period=period)
 
         
-    # Build the directory path (substitute stream for UKESM HiLLA).
-    if layout.get('streams'):
-        if variable not in layout['streams']:
-            raise KeyError(f"No stream configured for {model}/{scenario}/{variable}.")
-        stream = layout['streams'][variable]
-        path = layout['path_template'].format(member=member, var=native_var, stream=stream)
-    else:
-        path = layout['path_template'].format(member=member, var=native_var)
-    full_path = REFL_BUCKET + path
- 
-    try:
-        all_files = s3.ls(full_path)
-    except FileNotFoundError:
-        print(f"  Path not found: {full_path}")
-        return None
- 
-    # Select the variable's files. Three filename conventions are handled.
-    overrides = layout.get('file_pattern_overrides', {})
-    if variable in overrides:
-        match = overrides[variable]
-        files = sorted(f for f in all_files if match in f and f.endswith('.nc'))
-    else:
-        fp = layout['file_pattern']
-        if fp == '':
-            files = sorted(f for f in all_files if f.endswith('.nc'))
-        elif '{member}' in fp:
-            match = fp.format(var=native_var, member=member)
-            files = sorted(f for f in all_files if match in f)
+    # Ordered source list, added 1 October 2026. A layout may carry a
+    # 'sources' tuple of {path_template, file_pattern, streams?,
+    # file_pattern_overrides?} dicts; they are tried in order and the first
+    # that yields files wins. A layout without one is wrapped into a single
+    # source from its own keys, which reads exactly as it did before.
+    sources = layout.get('sources') or ({
+        'path_template': layout['path_template'],
+        'file_pattern': layout['file_pattern'],
+        'streams': layout.get('streams'),
+        'file_pattern_overrides': layout.get('file_pattern_overrides', {}),
+    },)
+
+    files, full_path = [], None
+    for si, source in enumerate(sources, 1):
+        streams = source.get('streams') or layout.get('streams')
+        if streams:
+            if variable not in streams:
+                raise KeyError(f"No stream configured for "
+                               f"{model}/{scenario}/{variable}.")
+            path = source['path_template'].format(
+                member=member, var=native_var, stream=streams[variable])
         else:
-            match = fp.format(var=native_var)
-            files = sorted(f for f in all_files if match in f)
- 
+            path = source['path_template'].format(member=member,
+                                                  var=native_var)
+        full_path = REFL_BUCKET + path
+
+        try:
+            all_files = s3.ls(full_path)
+        except FileNotFoundError:
+            if len(sources) == 1:
+                # Byte-identical to the behaviour before the source list
+                # existed: one message and an immediate return, not a
+                # fall-through to the "no files" message below.
+                print(f"  Path not found: {full_path}")
+                return None
+            continue
+
+        # Select the variable's files. Three filename conventions are handled.
+        overrides = (source.get('file_pattern_overrides')
+                     or layout.get('file_pattern_overrides', {}))
+        if variable in overrides:
+            match = overrides[variable]
+            cand = sorted(f for f in all_files
+                          if match in f and f.endswith('.nc'))
+        else:
+            fp = source['file_pattern']
+            if fp == '':
+                cand = sorted(f for f in all_files if f.endswith('.nc'))
+            elif '{member}' in fp:
+                match = fp.format(var=native_var, member=member)
+                cand = sorted(f for f in all_files if match in f)
+            else:
+                match = fp.format(var=native_var)
+                cand = sorted(f for f in all_files if match in f)
+
+        if cand:
+            files = cand
+            if len(sources) > 1:
+                print(f"  source {si} of {len(sources)}: {full_path}")
+            break
+
     if not files:
-        print(f"  No files for {model}/{scenario}/{member}/{variable} in {full_path}")
+        if len(sources) > 1:
+            print(f"  No files for {model}/{scenario}/{member}/{variable} "
+                  f"in any of {len(sources)} sources; "
+                  f"last tried {full_path}")
+        else:
+            print(f"  No files for {model}/{scenario}/{member}/{variable} "
+                  f"in {full_path}")
         return None
     print(f"  {model}/{scenario}/{member}/{variable}: {len(files)} files")
  
@@ -1033,16 +1596,49 @@ def read_model_var(model, scenario, member, variable, period):
     time_span = (str(period.start_year), str(period.end_year))
     for f in files:
         with fsspec.open('s3://' + f, mode='rb') as fobj:
-            ds_full = xr.open_dataset(fobj, engine='h5netcdf').load()
-            ds = ds_full.sel(time=slice(*time_span)).load()
+            # Lazy open, then subset to the one variable, THEN load. The
+            # earlier code loaded every variable in the file over its whole
+            # span before slicing, which is what put the kernel over 30 GB on
+            # a CESM member: nine files, the full CAM daily history set in
+            # each. Only native_var is read downstream.
+            ds_lazy = xr.open_dataset(fobj, engine='h5netcdf')
+            if native_var not in ds_lazy.data_vars:
+                print(f"    {f.rsplit('/', 1)[-1]}: no {native_var}, skipped")
+                ds_lazy.close()
+                continue
+            # Before the variable subset, because the fix reads time_bnds and
+            # the subset drops it, and before the slice, because the slice
+            # uses the time coordinate the fix corrects.
+            if model == 'CESM':
+                ds_lazy = _fix_cesm_time(ds_lazy)
+            # Ask the size before loading. _fix_cesm_time leaves an outer
+            # indexer in the lazy chain, and .load() on an empty selection
+            # then raises "zero-size array to reduction operation maximum"
+            # from the backend's bounds check rather than returning an empty
+            # array. Every member has files outside the window, so this is the
+            # ordinary case. sizes is lazy, so nothing is read here, and the
+            # reader no longer loads files it is about to discard.
+            sub = _cut_lat_band(
+                ds_lazy[[native_var]].sel(time=slice(*time_span)))
+            if sub.sizes.get('time', 0) == 0:
+                ds_lazy.close()
+                continue
+            ds = sub.load()
+            ds_lazy.close()
             if len(ds.time) > 0:
                 datasets.append(ds)
-            del ds_full, ds
+            del ds_lazy, ds
  
     if not datasets:
         return None
     combined = xr.concat(datasets, dim='time')
+    del datasets                      # the pieces are in `combined` now
     _, uniq = np.unique(combined.time.values, return_index=True)
+    if uniq.size == combined.sizes['time']:
+        # No overlapping boundary to drop. The isel below is then an identity
+        # operation that costs a full copy of the array, which for a CESM
+        # member over 2015-2100 is about 7 GB.
+        return combined
     return combined.isel(time=sorted(uniq))
  
  
@@ -1120,7 +1716,18 @@ def growing_season_length_global(tas, freq='YS', **kwargs):
     .dt.year keeps working downstream. Partial seasons at the ends of the
     record are dropped, which is why the final SH year is NaN for a record
     ending in December: that season needs the following January to June.
-    
+
+    NB:
+    The result is then put back on the record's own calendar-year stamps. This
+    matters for a member whose daily record stops part-way through a year.
+    Dropping the incomplete bin, rather than masking it, shortened the time
+    axis, and the span in the filename is read from that axis: three MIROC
+    G6-1.5K-HiLLA members were written as 2035-2083 while their own Rx1day and
+    Rx5day files, built from the same record, said 2035-2084 with the final
+    year masked. Both described the same thing. One index disagreeing with its
+    siblings about how long the record is will be read as a data problem by
+    anyone who did not write the code, so GSL now masks the incomplete year
+    like everything else.
     """
     if freq != 'YS':
         raise ValueError(f'growing_season_length is annual-only; got {freq!r}')
@@ -1133,14 +1740,63 @@ def growing_season_length_global(tas, freq='YS', **kwargs):
             continue
         g = growing_season_length(sub, mid_date=mid, freq=f, **kwargs)
         g = g.isel(time=_complete_bins(sub, f).values)
-        cal = type(g['time'].values[0])
-        g = g.assign_coords(
-            time=[cal(int(y), 1, 1) for y in g['time'].dt.year.values])
+        # January-first stamps on the record's own calendar. The element
+        # type cannot be called uniformly: a cftime class takes
+        # (year, month, day), while numpy.datetime64 takes at most
+        # (value, unit) and raises "function takes at most 2 arguments
+        # (3 given)". CESM2-WACCM is noleap and UKESM1-1 is 360_day, so both
+        # decode to cftime and the three-argument call worked for two years.
+        # MIROC-ES2H is proleptic_gregorian inside pandas' range and decodes
+        # to datetime64[ns], which failed all three MIROC GSL units on
+        # 4 October 2026 and no other index, GSL being the only one that
+        # rebuilds its own time coordinate.
+        years = [int(y) for y in g['time'].dt.year.values]
+        first = g['time'].values[0]
+        if isinstance(first, np.datetime64):
+            stamps = np.array([f'{y:04d}-01-01' for y in years],
+                              dtype='datetime64[ns]')
+        else:
+            cal = type(first)
+            stamps = [cal(y, 1, 1) for y in years]
+        g = g.assign_coords(time=stamps)
         out.append(g)
     if not out:
         raise ValueError('no latitudes in the input')
-    return xr.concat(out, dim='lat', join='outer',
-                     combine_attrs='override').sortby('lat')
+    g = xr.concat(out, dim='lat', join='outer', combine_attrs='override')
+    # Back onto the input's own latitude order.
+    #
+    # This was .sortby('lat'), which returns an ascending axis whatever it was
+    # given. That is a no-op for CESM2-WACCM and UKESM, whose latitude runs
+    # ascending, and it reverses the axis for MIROC-ES2H, whose native latitude
+    # runs descending (the native MIROC-ES2H grid). GSL is the only index that splits
+    # the field by hemisphere and so the only one that sorted, which left it on
+    # a reversed axis relative to its seventeen siblings in all twenty-eight
+    # MIROC member directories (8 G6-1.5K-HiLLA, since r04 and r06 are shorter
+    # runs the scenario window drops, plus 10 G6-1.5K-SAI and 10 SSP2-4.5).
+    #
+    # No value was ever wrong. The coordinate travels with the data and xarray
+    # aligns on coordinates, so anything that read these through xarray
+    # arithmetic got the right answer, and any latitude-weighted mean masks the
+    # latitude vector it is handed rather than slicing, so the band means are
+    # right too. What it does produce is a released dataset whose variables
+    # disagree about the direction of latitude, which invites the positional
+    # mistake this pipeline avoided by luck rather than by design.
+    #
+    # Found 29 September 2026 by comparing the axes of
+    # every index inside one member directory. verify_tree opens one file at a
+    # time and check_spans compares time only, so neither had reason to look.
+    # The 28 files already written were repaired in place with
+    # fix_gsl_lat_order.py, which reindexes rather than recomputes: a
+    # permutation of the same coordinate values moves rows and invents nothing,
+    # and each repair was verified against the original after sorting both by
+    # latitude.
+    g = g.reindex(lat=tas['lat'])
+    # Every calendar-year stamp the record touches, complete or not. Years the
+    # hemispheres dropped come back as NaN, and the stray July-stamped bin that
+    # opens the southern series (Jan-Jun of the first year, relabelled to the
+    # preceding January) goes away. Values already present are untouched: a
+    # full record is unchanged by this line.
+    return g.reindex(time=_complete_bins(tas, 'YS')['time'])
 
 
 # Percentile indices carry 'percentile' and a 'threshold_kwarg' naming the
@@ -1149,9 +1805,21 @@ def growing_season_length_global(tas, freq='YS', **kwargs):
 # and their threshold lives in 'extra_kwargs'.
 INDEX_REGISTRY = {
     'R95p': {'variable': 'pr',     'percentile': 95, 'xclim_fn': days_over_precip_thresh,
-             'threshold_kwarg': 'pr_per',     'extra_kwargs': {'thresh': '1 mm/day'}},
+             'threshold_kwarg': 'pr_per',     'extra_kwargs': {'thresh': '1 mm/day'},
+             # The ETCCDI wet-day convention, which SECTION 9 above
+             # calls mandatory and which was never switched on: this
+             # key was absent, so info.get('wet_day_thresh') was None
+             # and every R95p file built before 30 September 2026
+             # carries an all-day percentile.
+             'wet_day_thresh': '1 mm/day'},
     'R99p': {'variable': 'pr',     'percentile': 99, 'xclim_fn': days_over_precip_thresh,
-             'threshold_kwarg': 'pr_per',     'extra_kwargs': {'thresh': '1 mm/day'}},
+             'threshold_kwarg': 'pr_per',     'extra_kwargs': {'thresh': '1 mm/day'},
+             # The ETCCDI wet-day convention, which SECTION 9 above
+             # calls mandatory and which was never switched on: this
+             # key was absent, so info.get('wet_day_thresh') was None
+             # and every R99p file built before 30 September 2026
+             # carries an all-day percentile.
+             'wet_day_thresh': '1 mm/day'},
     'TX90p': {'variable': 'tasmax', 'percentile': 90, 'xclim_fn': tx90p,
               'threshold_kwarg': 'tasmax_per', 'extra_kwargs': {}},
     'TX10p': {'variable': 'tasmax', 'percentile': 10, 'xclim_fn': tx10p,
@@ -1164,6 +1832,7 @@ INDEX_REGISTRY = {
              'threshold_kwarg': 'tasmax_per', 'extra_kwargs': {'window': 6}},
     'CSDI': {'variable': 'tasmin', 'percentile': 10, 'xclim_fn': cold_spell_duration_index,
              'threshold_kwarg': 'tasmin_per', 'extra_kwargs': {'window': 6}},
+
     # --- fixed-threshold indices (no baseline percentile) ---
     'GSL': {'variable': 'tas', 'percentile': None,
             'xclim_fn': growing_season_length_global, 'threshold_kwarg': None,
@@ -1176,7 +1845,10 @@ INDEX_REGISTRY = {
                                   'southern gridpoints use mid_date 01-01 on a '
                                   'July-June year relabelled to January stamps. '
                                   'Southern final year is NaN because a July-June '
-                                  'bin needs data into the following Jan-Jun.')}},
+                                  'bin needs data into the following Jan-Jun. A '
+                                  'calendar year the daily record does not fully '
+                                  'cover is NaN in both hemispheres, as it is for '
+                                  'every other index in this set.')}},
     'GDD': {'variable': 'tas', 'percentile': None,
             'xclim_fn': growing_degree_days, 'threshold_kwarg': None,
             'extra_kwargs': {'thresh': '4.0 degC'},
@@ -1186,7 +1858,7 @@ INDEX_REGISTRY = {
                                   'numerically identical to Celsius degree-days '
                                   'because the index is a sum of temperature '
                                   'differences.')}},
-    
+
     'RX1D': {'variable': 'pr', 'percentile': None,
              'xclim_fn': max_1day_precipitation_amount,
              'threshold_kwarg': None, 'extra_kwargs': {},
@@ -1203,22 +1875,372 @@ INDEX_REGISTRY = {
                                    'days in the aggregation period. Name follows the '
                                    'ReflectiveCloud/etccdi-indices zarr store so the '
                                    'two index sets merge without renaming.')}},
+
+    # ---- the fourteen that were the shared notebooks' ----------------------
+    # Transcribed from the TEMP, PREC_AGG and PREC_SPELL tables in
+    # src/make_shared_index_nbs.py on Derecho, which generated the notebooks
+    # that built these same fourteen into the GLADE tree. Function and
+    # threshold match exactly, so the two archives hold the same quantity.
+    #
+    # None of them takes a percentile, so 'percentile' is None and
+    # 'threshold_kwarg' is None throughout, and compute_baseline_threshold
+    # returns (None, None) for each.
+
+    'SU': {'variable': 'tasmax', 'percentile': None,
+           'xclim_fn': tx_days_above, 'threshold_kwarg': None,
+           'extra_kwargs': {'thresh': '25.0 degC'},
+           'attrs': {'long_name': 'Summer days',
+                     'comment': 'Days with daily maximum temperature above '
+                                '25 degC.'}},
+    'ID': {'variable': 'tasmax', 'percentile': None,
+           'xclim_fn': ice_days, 'threshold_kwarg': None,
+           'extra_kwargs': {'thresh': '0 degC'},
+           'attrs': {'long_name': 'Ice days',
+                     'comment': 'Days with daily maximum temperature below '
+                                '0 degC.'}},
+    'TXX': {'variable': 'tasmax', 'percentile': None,
+            'xclim_fn': tx_max, 'threshold_kwarg': None, 'extra_kwargs': {},
+            'attrs': {'long_name': 'Warmest day',
+                      'comment': ('Annual maximum of daily maximum '
+                                  'temperature, in KELVIN. xclim returns the '
+                                  'units it was given and this pipeline feeds '
+                                  'kelvin. ETCCDI tables report this index in '
+                                  'Celsius; subtract 273.15 at plotting time '
+                                  'rather than here, so the file says what it '
+                                  'contains.')}},
+    'TXN': {'variable': 'tasmax', 'percentile': None,
+            'xclim_fn': tx_min, 'threshold_kwarg': None, 'extra_kwargs': {},
+            'attrs': {'long_name': 'Coldest day',
+                      'comment': ('Annual minimum of daily maximum '
+                                  'temperature, in kelvin. See TXX on '
+                                  'units.')}},
+    'FD': {'variable': 'tasmin', 'percentile': None,
+           'xclim_fn': frost_days, 'threshold_kwarg': None,
+           'extra_kwargs': {'thresh': '0 degC'},
+           'attrs': {'long_name': 'Frost days',
+                     'comment': 'Days with daily minimum temperature below '
+                                '0 degC.'}},
+    'TN': {'variable': 'tasmin', 'percentile': None,
+           'xclim_fn': tn_days_above, 'threshold_kwarg': None,
+           'extra_kwargs': {'thresh': '20.0 degC'},
+           'attrs': {'long_name': 'Tropical nights',
+                     'comment': ('Days with daily minimum temperature above '
+                                 '20 degC. ETCCDI calls this index TR, and TN '
+                                 'conventionally means daily minimum '
+                                 'temperature itself. The name follows the '
+                                 'ReflectiveCloud/etccdi-indices zarr store so '
+                                 'the two index sets merge without renaming; '
+                                 'naming.canon_index resolves tr to the same '
+                                 'file.')}},
+    'TNX': {'variable': 'tasmin', 'percentile': None,
+            'xclim_fn': tn_max, 'threshold_kwarg': None, 'extra_kwargs': {},
+            'attrs': {'long_name': 'Warmest night',
+                      'comment': ('Annual maximum of daily minimum '
+                                  'temperature, in kelvin. See TXX on '
+                                  'units.')}},
+    'TNN': {'variable': 'tasmin', 'percentile': None,
+            'xclim_fn': tn_min, 'threshold_kwarg': None, 'extra_kwargs': {},
+            'attrs': {'long_name': 'Coldest night',
+                      'comment': ('Annual minimum of daily minimum '
+                                  'temperature, in kelvin. See TXX on '
+                                  'units.')}},
+
+    'PRCPTOT': {'variable': 'pr', 'percentile': None,
+                'xclim_fn': prcptot, 'threshold_kwarg': None,
+                'extra_kwargs': {},
+                'attrs': {'long_name': 'Total precipitation',
+                          'comment': 'Annual sum of daily precipitation.'}},
+    'SDII': {'variable': 'pr', 'percentile': None,
+             'xclim_fn': daily_pr_intensity, 'threshold_kwarg': None,
+             'extra_kwargs': {'thresh': '1 mm/day'},
+             'attrs': {'long_name': 'Simple daily intensity index',
+                       'comment': 'Mean precipitation on wet days, those at or '
+                                  'above 1 mm/day.'}},
+    'R10MM': {'variable': 'pr', 'percentile': None,
+              'xclim_fn': wetdays, 'threshold_kwarg': None,
+              'extra_kwargs': {'thresh': '10 mm/day', 'op': '>='},
+              'attrs': {'long_name': 'Heavy precipitation days',
+                        'comment': 'Days at or above 10 mm/day. op is >= '
+                                   'rather than xclim\'s default >.'}},
+    'R20MM': {'variable': 'pr', 'percentile': None,
+              'xclim_fn': wetdays, 'threshold_kwarg': None,
+              'extra_kwargs': {'thresh': '20 mm/day', 'op': '>='},
+              'attrs': {'long_name': 'Very heavy precipitation days',
+                        'comment': 'Days at or above 20 mm/day. op is >= '
+                                   'rather than xclim\'s default >.'}},
+
+    # The two spells. lat_blocked because the run-length encoding holds several
+    # intermediates the shape of the whole record; see
+    # compute_annual_index_for_member.
+    'CDD': {'variable': 'pr', 'percentile': None,
+            'xclim_fn': maximum_consecutive_dry_days, 'threshold_kwarg': None,
+            'extra_kwargs': {'thresh': '1 mm/day'}, 'lat_blocked': True,
+            'attrs': {'long_name': 'Consecutive dry days',
+                      'comment': ('Longest run of days below 1 mm/day within '
+                                  'the year. xclim resamples before the '
+                                  'run-length encoding, so a spell crossing '
+                                  'New Year is cut at the boundary. That is '
+                                  'the opposite convention to Rx5day, whose '
+                                  'five-day window does reach back into the '
+                                  'previous year. Both are xclim defaults and '
+                                  'neither is visible in the data.')}},
+    'CWD': {'variable': 'pr', 'percentile': None,
+            'xclim_fn': maximum_consecutive_wet_days, 'threshold_kwarg': None,
+            'extra_kwargs': {'thresh': '1 mm/day'}, 'lat_blocked': True,
+            'attrs': {'long_name': 'Consecutive wet days',
+                      'comment': ('Longest run of days at or above 1 mm/day '
+                                  'within the year. Cut at the year boundary; '
+                                  'see CDD.')}},
 }
  
  
 # ============================================================================
 # SECTION 10  -  Baseline percentile threshold
 # ============================================================================
+# Offset between pooled members, in years. A multiple of 400 leaves the
+# Gregorian leap cycle where it is, so a pooled record on a standard calendar
+# keeps the same distribution of 29 February as the members it came from. CESM
+# is noleap and would not care; MIROC-ES2H is proleptic_gregorian and would.
+POOL_OFFSET_YEARS = 400
+
+
+def _to_cftime(da):
+    """
+    The same record with its time axis on cftime objects.
+
+    Returned unchanged when the axis already holds cftime, which is every
+    GLADE read. A datetime64 axis is converted on the calendar the file
+    records, because _shift_years cannot offset datetime64 at all: that dtype
+    spans 1678 to 2262 at nanosecond precision, so 2020 plus POOL_OFFSET_YEARS
+    is out of bounds. cftime has no such limit.
+
+    Safe because percentile_doy returns an array indexed by dayofyear, not by
+    time. The pooled axis lives and dies inside pooled_percentile_doy.
+    """
+    t = da['time'].values
+    if t.size and isinstance(t[0], np.datetime64):
+        cal = (da['time'].encoding.get('calendar')
+               or da['time'].attrs.get('calendar') or 'standard')
+        out = da.convert_calendar(cal, use_cftime=True)
+        # convert_calendar does not carry the variable attrs across, and the
+        # units are what xclim checks on the way into percentile_doy.
+        out.attrs.update(da.attrs)
+        return out
+    return da
+
+
+def _shift_years(da, offset):
+    """The same record stamped `offset` years later, calendar preserved."""
+    da = _to_cftime(da)
+    if not offset:
+        return da
+    t = da['time'].values
+    out = np.empty(t.shape, dtype=object)
+    for i, x in enumerate(t):
+        out[i] = x.replace(year=x.year + offset)
+    return da.assign_coords(time=('time', out))
+
+
+def pooled_percentile_doy(member_arrays, percentile, window=5,
+                          wet_day_thresh=None, lat_blocks=8, verbose=True):
+    """
+    Day-of-year percentile over several members pooled into ONE sample.
+
+    Why pooled rather than averaged. Averaging each member's own quantile is not
+    the quantile of the pooled sample, and the two diverge in the tail. The test
+    is one a reference simulation passes by construction: it must exceed its own
+    Nth percentile on (100 - N) percent of days. Measured on CESM2-WACCM over
+    30N to 60N, baseline 2015-2034:
+
+        TX90p   expected 10.0 %   averaged 10.12 %   pooled 9.94 %
+        R99p    expected  1.00 %  averaged  0.80 %   pooled 0.98 %
+
+    Averaging put R99p 20 percent low; pooling lands within 2 percent. TX90p is
+    barely affected either way.
+
+    The SIGN of the averaging error is not explained, and this docstring will not
+    pretend otherwise. On a synthetic gamma sample with about 40 wet values per
+    member per day-of-year window, averaging errs the other way and gives 2.37
+    percent against the same 1 percent target, while pooling gives 0.81. Pooling
+    was closer in both, which is the reason for the change; the direction of the
+    averaging error evidently depends on how many values each member contributes
+    to the estimate, and nobody has worked out where the crossover is. Treat the
+    20 percent as measured for this archive at this baseline and sample size,
+    not as a general result.
+
+    Why this was not done before. Stacking members before percentile_doy gives
+    duplicate (year, dayofyear) pairs and fails. Offsetting each member's years
+    by a multiple of 400 before concatenation makes the pooled axis monotonic
+    with unique pairs and preserves the leap cycle, which is the whole fix. The
+    rolling window crosses each join once, touching `window` days of a record
+    tens of thousands of days long.
+
+    Memory. Pooling needs every member at once: five CESM members over 20 years
+    at f09 is about 8 GB of float32 before percentile_doy builds its rolling
+    construct. The latitude blocking below loads only one block across all
+    members at a time, so the peak scales as 1/lat_blocks. Pass lazy arrays and
+    they are loaded a block at a time; pass loaded ones and only the construct
+    is bounded.
+
+    member_arrays : dict of {member: DataArray} or a list of DataArray
+    """
+    arrays = (list(member_arrays.values()) if isinstance(member_arrays, dict)
+              else list(member_arrays))
+    if not arrays:
+        raise ValueError('pooled_percentile_doy: no members given')
+
+    lat_name = 'lat' if 'lat' in arrays[0].dims else None
+    if lat_name is None or lat_blocks is None or lat_blocks <= 1:
+        slices = [slice(None)]
+    else:
+        n_lat = arrays[0].sizes[lat_name]
+        edges = np.linspace(0, n_lat, int(lat_blocks) + 1).astype(int)
+        slices = [slice(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:])
+                  if b > a]
+
+    if verbose:
+        print(f"  pooled percentile over {len(arrays)} member(s), "
+              f"{len(slices)} latitude block(s)"
+              + (f", wet-day masking >= {wet_day_thresh}"
+                 if wet_day_thresh is not None else ""))
+
+    out = []
+    for k, sl in enumerate(slices):
+        parts = []
+        for j, da in enumerate(arrays):
+            sub = (da.isel({lat_name: sl}) if lat_name is not None else da)
+            sub = sub.load()
+            if wet_day_thresh is not None:
+                # Express the threshold in the data's units, then mask dry days
+                # to NaN. percentile_doy is NaN-aware, so the percentile is over
+                # wet days only. Reassign attrs: .where() drops the units that
+                # downstream xclim checks rely on.
+                t = convert_units_to(wet_day_thresh, sub)
+                masked = sub.where(sub >= t)
+                masked.attrs.update(sub.attrs)
+                sub = masked
+            parts.append(_shift_years(sub, j * POOL_OFFSET_YEARS))
+        big = xr.concat(parts, dim='time')
+        big.attrs.update(parts[0].attrs)
+        p = percentile_doy(big, per=percentile, window=window).load()
+        out.append(p)
+        del parts, big
+        gc.collect()
+        if verbose and len(slices) > 1:
+            print(f"    latitude block {k + 1}/{len(slices)} done")
+
+    thr = out[0] if len(out) == 1 else xr.concat(out, dim=lat_name)
+    thr.attrs.update(out[0].attrs)
+
+    # percentile_doy records climatology_bounds from the time axis it is
+    # given, and the axis it is given here is the pooled one, with member j
+    # shifted by j * POOL_OFFSET_YEARS. Three CESM members over 2015-2034
+    # make it write 2015-01-01 to 2834-12-31; ten MIROC members make it
+    # 5634-12-31. The baseline is 2015-2034 and 2020-2034 respectively.
+    # arrays[0] is member j=0 and is never shifted, so its own span is the
+    # real one. POOL_OFFSET_YEARS is recorded so the artefact is recognisable
+    # if it surfaces anywhere else.
+    _t0 = arrays[0]['time'].values
+    thr.attrs['climatology_bounds'] = [str(_t0[0])[:10], str(_t0[-1])[:10]]
+    thr.attrs['pooled_axis_offset_years'] = POOL_OFFSET_YEARS
+
+    thr.attrs['n_baseline_members'] = len(arrays)
+    thr.attrs['percentile_sample'] = 'pooled across baseline members'
+    if wet_day_thresh is not None:
+        thr.attrs['wet_day_threshold'] = str(wet_day_thresh)
+    del out
+    gc.collect()
+    return thr
+
+
+# ----------------------------------------------------------------------------
+# Baseline member selection, ported from derecho_layout.py on 2 October 2026.
+#
+# The members the percentile threshold is pooled over are NOT the members
+# indices are written for. write_index_dataset used to default one to the
+# other, which meant growing an output ensemble silently changed every
+# threshold computed from it.
+# ----------------------------------------------------------------------------
+
+# Members with defective records, dropped before anything else. Derecho's only
+# entry is ('UKESM10', 'SSP245'): {'002': 'missing 7 of 20 years in 2020-2039'},
+# and there is no UKESM10 layout key here, so this is empty on the Hub. Kept so
+# a future exclusion has somewhere to go and so the two platforms diff cleanly.
+BASELINE_EXCLUDE = {}
+
+# The reference ensemble cut to the size of the SAI ensemble. Cindy Wang's
+# convention, agreed 30 September 2026: as many SSP2-4.5 members as the G6
+# experiments have. It binds on CESM2-WACCM alone, five against three, and she
+# uses 006, 007 and 008 rather than any three of the five. Those are Derecho's
+# GLADE directory ids; the same runs are r6, r7 and r8 here.
+#
+# MIROC-ES2H is ten against ten and stays at ten. All ten HiLLA members run
+# to 2084-12-31. r04 and r06 were once recorded as ending in 2077 and 2079;
+# the GLADE files disproved that on 16 October 2026 and the bucket copies
+# on 26 October 2026 (patch_hub_miroc_hilla_10.py). One threshold serves HiLLA and
+# SAI alike, as it has to, since HiLLA minus SAI is the contrast most of
+# the results rest on.
+# UKESM1-1 is already three against three.
+#
+# The cost of the cut was measured before it was made, on CESM over 30N to 60N:
+# the five-member and three-member pooled thresholds differ by a median of
+# -0.0002 mm/day for R99p and -0.035 K for TX90p, rms 6.45 mm/day and 0.30 K.
+# No systematic shift, added scatter.
+BASELINE_MATCH_SAI = {
+    ('CESM', 'SSP245'): ('r6', 'r7', 'r8'),
+}
+
+
+def baseline_members(model, scenario='SSP245'):
+    """
+    Members the percentile threshold is pooled over, with the excluded ones
+    dropped and named.
+
+    Two filters, in order. BASELINE_EXCLUDE removes members with defective
+    records. BASELINE_MATCH_SAI then cuts what is left to the size of the SAI
+    ensemble, which is a convention rather than a data problem.
+    """
+    all_m = tuple(get_layout(model, scenario)['members'])
+    drop = BASELINE_EXCLUDE.get((model, scenario), {})
+    keep = tuple(m for m in all_m if m not in drop)
+    for m, why in drop.items():
+        if m in all_m:
+            print(f'  baseline excludes {model}/{scenario}/{m}: {why}')
+    if not keep:
+        raise RuntimeError(f'every baseline member excluded for {model}')
+
+    match = BASELINE_MATCH_SAI.get((model, scenario))
+    if match:
+        missing = [m for m in match if m not in keep]
+        if missing:
+            # Naming a member that is not there means the archive moved under
+            # the convention. Guessing a substitute would put an unrecorded
+            # member set into every threshold, so stop instead.
+            raise RuntimeError(
+                f'BASELINE_MATCH_SAI names {missing} for {model}/{scenario}, '
+                f'which is not among the available members {keep}. Fix the '
+                f'table or the layout rather than letting the run continue.')
+        return tuple(match)
+    return keep
+
+
 def compute_baseline_threshold(model, variable, percentile, baseline_period,
-                               window=5, members=None, wet_day_thresh=None):
+                               window=5, members=None, wet_day_thresh=None,
+                               lat_blocks=8):
     """
     Day-of-year percentile threshold from SSP245 over the baseline window.
- 
+
     percentile_doy with a 5-day centered window is the ETCCDI standard. The
-    threshold is computed per member then averaged across members (Cindy Wang's
-    convention; stacking members before percentile_doy would create duplicate
-    (year, dayofyear) indices and crash). Returns (threshold, baseline_data) so
-    the SSP245 baseline load can be reused when a comparison references it.
+    threshold is taken over every baseline member POOLED into one sample, not by
+    averaging each member's own quantile.
+
+    This changed on 30 September 2026. It was per member then averaged, because
+    stacking members before percentile_doy gives duplicate (year, dayofyear)
+    pairs and fails. Offsetting each member's years by a multiple of 400 fixes
+    that, and the averaged convention turned out to bias R99p 20 percent low:
+    see pooled_percentile_doy for the measurement. TX90p is unaffected. Indices
+    on the two conventions are not comparable and must not share an output
+    tree.
 
     wet_day_thresh : str or None
         For precipitation indices, a quantity like '1 mm/day'. When set, days
@@ -1229,7 +2251,10 @@ def compute_baseline_threshold(model, variable, percentile, baseline_period,
         None for temperature, which uses all days. Note: in very arid cells with
         no wet days in a day-of-year window, the wet-day percentile is undefined
         (NaN); those cells correctly drop out of the precip index.
-        
+
+    Returns (threshold, baseline_data) 
+    so the SSP245 baseline load can be reused when a comparison references it.
+
     """
     if percentile is None:
         # Fixed-threshold index (e.g. GSL, GDD): its threshold is a constant in
@@ -1248,30 +2273,16 @@ def compute_baseline_threshold(model, variable, percentile, baseline_period,
 
     if wet_day_thresh is not None:
         print(f"  Wet-day masking before percentile (>= {wet_day_thresh})")
-        
-    print("  Computing percentile_doy per member...")
-    per_member = {}
-    for m, data in baseline_data.items():
-        print(f"    {m}...")
-        if wet_day_thresh is not None:
-            # Express the wet-day threshold in the data's units, then mask dry
-            # days to NaN. percentile_doy is NaN-aware, so the percentile is
-            # computed over wet days only. Reassign attrs because .where() can
-            # drop the units that downstream xclim checks rely on.
-            thr = convert_units_to(wet_day_thresh, data)
-            data_for_pct = data.where(data >= thr)
-            data_for_pct.attrs.update(data.attrs)
-        else:
-            data_for_pct = data
 
-        per_member[m] = percentile_doy(data_for_pct, per=percentile, window=window)
- 
-    stacked = xr.concat(list(per_member.values()),
-                        dim=pd.Index(list(per_member.keys()), name='member'))
-    threshold = stacked.mean('member')
-    # Preserve percentile_doy attrs that downstream xclim functions check.
-    threshold.attrs.update(per_member[next(iter(per_member))].attrs)
- 
+    threshold = pooled_percentile_doy(
+        baseline_data, percentile, window=window,
+        wet_day_thresh=wet_day_thresh, lat_blocks=lat_blocks)
+    # Which runs the threshold pooled, carried across from the daily fields.
+    # percentile_doy drops source attributes and the member list is the one
+    # thing a reader cannot recover from the file otherwise.
+    threshold.attrs['percentile_baseline_members'] = ','.join(
+        str(m) for m in baseline_data)
+
     print(f"  Threshold global mean: {float(threshold.mean()):.2f} "
           f"{threshold.attrs.get('units', '')}")
     print(f"  Range: {float(threshold.min()):.2f} to {float(threshold.max()):.2f}")
@@ -1900,25 +2911,11 @@ def save_nc_to_s3(obj, s3_path):
     finally:
         os.remove(tmp)
 
-'''
-def compute_annual_index_for_member(da, index_name, threshold, freq='YS'):
-    """
-    Annual index field (time, lat, lon) for one member, against a fixed
-    baseline percentile. This is compute_index_for_members without the time mean,
-    so every year is kept and the file matches the fixed-index annual files. The
-    singleton 'percentiles' dim xclim attaches is squeezed so the field stacks
-    cleanly into (member, year, lat, lon).
-    
-    """
-    info = INDEX_REGISTRY[index_name]
-    _check_freq(index_name, freq)
-    kwargs = {info['variable']: da, 'freq': freq, **info['extra_kwargs']}
-    if info['threshold_kwarg'] is not None:
-        kwargs[info['threshold_kwarg']] = threshold
-    annual = info['xclim_fn'](**kwargs).squeeze(drop=True)
-    annual.name = index_name.upper()
-    return annual
-'''
+# Target bytes per latitude block for the spell indices, not a fixed number of
+# latitudes. Sizing by bytes keeps the peak the same on MIROC's T85 grid and on
+# CESM's f09 instead of leaving it to the grid. Taken from
+# make_shared_index_nbs.py, which uses the same figure.
+SPELL_BLOCK_BYTES = 100e6
 def compute_annual_index_for_member(da, index_name, threshold,
                                     freq='YS', season=None, min_days=360):
     """
@@ -1935,7 +2932,37 @@ def compute_annual_index_for_member(da, index_name, threshold,
     if info['threshold_kwarg'] is not None:
         kwargs[info['threshold_kwarg']] = threshold
     
-    annual = info['xclim_fn'](**kwargs).squeeze(drop=True)
+    if info.get('lat_blocked') and 'lat' in da.dims:
+        # CDD and CWD only. A longest-run reduction needs the whole time axis
+        # per grid point, and xclim's run-length encoding holds several
+        # intermediates the shape of the input while it does that. On this path
+        # the input is already eager: 55 years at f09 is 20,075 x 192 x 288 x 4
+        # bytes, about 4.4 GB, and a few intermediates on top of that is how a
+        # 30 GB kernel dies with no traceback. The shared notebooks avoid it by
+        # chunking on latitude at about 100 MB a block, and this is the same
+        # device as pooled_percentile_doy's lat_blocks.
+        #
+        # Blocking along latitude is safe for these two specifically because
+        # neither reduction couples grid points. Do not set lat_blocked on an
+        # index that does.
+        import math
+        per_lat = int(da.sizes['time'] * da.sizes.get('lon', 1) * 4)
+        n = max(1, min(da.sizes['lat'],
+                       int(SPELL_BLOCK_BYTES // max(per_lat, 1))))
+        edges = list(range(0, da.sizes['lat'], n)) + [da.sizes['lat']]
+        parts = []
+        for a, b in zip(edges[:-1], edges[1:]):
+            sub = da.isel(lat=slice(a, b))
+            kw = dict(kwargs)
+            kw[info['variable']] = sub
+            parts.append(info['xclim_fn'](**kw).squeeze(drop=True))
+        annual = (parts[0] if len(parts) == 1
+                  else xr.concat(parts, dim='lat'))
+        annual = annual.reindex(lat=da['lat'])
+        del parts
+        gc.collect()
+    else:
+        annual = info['xclim_fn'](**kwargs).squeeze(drop=True)
     # Mask bins the input does not fully cover. Without this a truncated final
     # year enters the archive as a real year with a count low in proportion to
     # its missing days: MIROC-ES2H G6-1.5K-HiLLA r02 stops 62 days into 2084 and
@@ -1961,8 +2988,114 @@ def compute_annual_index_for_member(da, index_name, threshold,
             'bin stamped with its first month; a DJF value labelled YYYY covers '
             'Dec YYYY, Jan YYYY+1, Feb YYYY+1')
 
-    annual.name = index_name.upper()
+    annual.name = index_name
     return annual
+
+
+# Provenance notes carried into every written index file, matching
+# etccdi_site.baseline_attrs on the Derecho side so the two trees agree.
+BASELINE_NOTE = {
+    'MIROC': ('MIROC-ES2H SSP2-4.5 was initialised at 2020 from combined prior '
+              'runs plus a short spin-up, so the first baseline years may still '
+              'carry adjustment in slow components.'),
+}
+
+# Deliberately names no directory. The Derecho original named
+# ETCCDI_indices_annual, which became the name of the POOLED tree when the
+# trees were renamed on 2 October 2026, leaving that sentence inside pooled
+# files claiming their own directory used the old convention.
+PERCENTILE_CONVENTION_CHANGED = (
+    '30 September 2026. Earlier files averaged the per-member percentiles '
+    'instead, and took the precipitation percentiles over all days rather '
+    'than wet days only. The two sets are not comparable. The superseded '
+    'tree was renamed with an _old suffix on 2 October 2026.')
+
+
+# Years of daily data held at once when computing one member's index. The
+# whole-record read put the kernel over 30 GB on a CESM member; see
+# _member_index_chunked. 0 restores the whole-record path.
+MEMBER_CHUNK_YEARS = int(os.environ.get('ETCCDI_CHUNK_YEARS', '20'))
+
+# Years of padding read either side of a block. RX5D is a 5-day running total,
+# so a window can straddle a year boundary; without the pad the block would
+# lose it. One year is far more than the five days needed and is the smallest
+# unit read_model_var accepts, since a Period is whole years.
+CHUNK_PAD_YEARS = 1
+
+
+def _member_index_chunked(model, scenario, member, variable, period,
+                          index_name, threshold, freq='YS', season=None,
+                          chunk_years=None, verbose=True):
+    """Annual index for one member, in blocks of years.
+
+    Each block is read with CHUNK_PAD_YEARS either side and the result trimmed
+    back to the block's own bins, so every bin is produced exactly once from
+    data that includes its neighbours. Peak memory is set by the block.
+
+    Returns the same object the whole-record path returns, or None if nothing
+    loaded, matching read_model_var.
+    """
+    chunk = MEMBER_CHUNK_YEARS if chunk_years is None else chunk_years
+    conv = get_variable_info(model, variable)['converter']
+
+    # src_ attributes are captured here because da exists only inside this
+    # function now. write_index_dataset used to take them off da directly;
+    # they ride back out on the returned object instead.
+    src = {}
+
+    def _one(p, label):
+        ds = read_model_var(model, scenario, member, variable, p)
+        if ds is None:
+            return None
+        da = conv(ds)
+        del ds
+        if not src:
+            src.update({_k: _v for _k, _v in da.attrs.items()
+                        if _k.startswith('src_')})
+        out = compute_annual_index_for_member(
+            da, index_name, threshold, freq=freq, season=season).load()
+        del da
+        gc.collect()
+        return out
+
+    def _finish(out):
+        if out is not None:
+            out.attrs.update(src)
+        return out
+
+    if chunk <= 0:
+        return _finish(_one(period, 'whole record'))
+
+    pieces = []
+    y = period.start_year
+    while y <= period.end_year:
+        y1 = min(y + chunk - 1, period.end_year)
+        p = Period(f'{period.name}_{y}_{y1}',
+                   y - CHUNK_PAD_YEARS, y1 + CHUNK_PAD_YEARS)
+        part = _one(p, f'{y}-{y1}')
+        if part is not None:
+            yrs = part['time'].dt.year
+            part = part.sel(time=((yrs >= y) & (yrs <= y1)))
+            if part.sizes.get('time', 0) > 0:
+                pieces.append(part)
+                if verbose:
+                    print(f'    block {y}-{y1}: '
+                          f'{part.sizes["time"]} bin(s) kept')
+            else:
+                del part
+        gc.collect()
+        y = y1 + 1
+
+    if not pieces:
+        return None
+    if len(pieces) == 1:
+        return _finish(pieces[0])
+    # combine_attrs defaults to taking the first piece's attrs; src is applied
+    # afterwards either way so the result does not depend on that.
+    out = xr.concat(pieces, dim='time')
+    del pieces
+    gc.collect()
+    return _finish(out)
 
 
 def write_index_dataset(model, index_name, scenarios=('HiLLA', 'SSP245'),
@@ -1977,7 +3110,7 @@ def write_index_dataset(model, index_name, scenarios=('HiLLA', 'SSP245'),
     computed once and applied to every scenario so counts are comparable across
     SSP245, HiLLA, and later SAI. Members are read one at a time and freed, so
     peak memory is one member's daily record.
-    
+
     """
     _check_freq(index_name, freq, season)
     if output_root is None:
@@ -1992,7 +3125,8 @@ def write_index_dataset(model, index_name, scenarios=('HiLLA', 'SSP245'),
     info = INDEX_REGISTRY[index_name]
     variable = info['variable']
     model_label = MODEL_LABEL[model]
-    idx_file = f'{index_name.upper()}.nc'
+    # The index name is used exactly as the registry spells it. upper() used to
+    # be applied here and turned R99p into R99P, which does not match the tree.
 
     default_periods = {
         'HiLLA':  Period('hilla',  2035, 2084),   # GeoMIP G6 window, edit if needed
@@ -2003,17 +3137,53 @@ def write_index_dataset(model, index_name, scenarios=('HiLLA', 'SSP245'),
         default_periods.update(scenario_periods)
 
     if ssp245_threshold_members is None:
-        ssp245_threshold_members = get_layout(model, 'SSP245')['members']
+        # The members pooled for the threshold, not the members written out.
+        # These were the same tuple until 2 October 2026, which meant growing
+        # an output ensemble changed every threshold taken from it.
+        ssp245_threshold_members = baseline_members(model, 'SSP245')
 
     if baseline_period is None:
-        baseline_period = BASELINE # unchanged default: 2020-2039
-        
-    threshold, baseline_data = compute_baseline_threshold(
-        model=model, variable=variable, percentile=info['percentile'],
-        baseline_period=baseline_period, members=ssp245_threshold_members,
-        wet_day_thresh=info.get('wet_day_thresh'))
-    
-    del baseline_data
+        baseline_period = BASELINE  # unchanged default: 2020-2039
+
+    # Threshold cache, added 1 October 2026. The key is the quantity rather
+    # than the index name, so WSDI reuses TX90p's tasmax P90 and CSDI reuses
+    # TN10p's tasmin P10: eight calls per model become six computations. The
+    # file on disk also survives a kernel restart, which matters more over a
+    # run this long, because the s3.exists skip below resumes the writing but
+    # would otherwise rebuild the threshold for the index that was in flight.
+    # percentile is None for the eighteen fixed-threshold indices and
+    # compute_baseline_threshold returns (None, None) before loading anything,
+    # so they never reach this.
+    if info['percentile'] is None:
+        threshold = None
+    else:
+        thr_dir = OUTDIR / 'cached_data'
+        thr_dir.mkdir(parents=True, exist_ok=True)
+        # The member set belongs in the key. Without it a threshold pooled
+        # over three members is loaded and announced as a cache hit after the
+        # layout grows to ten.
+        mem_tag = (f'{len(ssp245_threshold_members)}m-'
+                   + '-'.join(str(mm) for mm in ssp245_threshold_members))
+        thr_path = thr_dir / (
+            f"{model.lower()}_{variable}_p{info['percentile']}"
+            f"{'_wet' if info.get('wet_day_thresh') else ''}"
+            f"_{baseline_period.start_year}-{baseline_period.end_year}"
+            f"_{mem_tag}_threshold.nc")
+        if thr_path.exists():
+            threshold = load_threshold(thr_path)
+            print(f'  Loaded cached threshold {thr_path.name}')
+        else:
+            threshold, baseline_data = compute_baseline_threshold(
+                model=model, variable=variable,
+                percentile=info['percentile'],
+                baseline_period=baseline_period,
+                members=ssp245_threshold_members,
+                wet_day_thresh=info.get('wet_day_thresh'))
+            del baseline_data
+            gc.collect()
+            save_threshold(threshold, thr_path)
+            print(f'  Cached threshold {thr_path.name}')
+
     gc.collect()
 
     written = []
@@ -2026,45 +3196,105 @@ def write_index_dataset(model, index_name, scenarios=('HiLLA', 'SSP245'),
 
         for member in members:
             member_label = label_map.get(member, member)
-            s3_path = f'{output_root}/{model_label}/{scen_label}/{member_label}/{idx_file}'
-            if not overwrite and s3.exists(s3_path.replace('s3://', '')):
-                print(f'  exists, skip: {model_label}/{scen_label}/{member_label}/{idx_file}')
-                written.append(s3_path)
-                continue
+            member_dir = (f'{output_root}/{model_label}/{scen_label}/'
+                          f'{member_label}')
+            stem = f'{index_name}_{model_label}_{scen_label}_{member_label}'
+            # The year span is part of the filename and is not known until the
+            # member has been read, so the resume check globs on the stem
+            # instead of testing one key. Two matches mean an earlier run wrote
+            # a different span for this member, which is worth saying rather
+            # than skipping over.
+            if not overwrite:
+                hits = sorted(s3.glob(f"{member_dir.replace('s3://', '')}/"
+                                      f'{stem}_*.nc'))
+                if len(hits) > 1:
+                    print(f'  [WARN] {len(hits)} spans already present for '
+                          f'{stem}: '
+                          f'{[h.rsplit("/", 1)[-1] for h in hits]}')
+                if hits:
+                    print(f'  exists, skip: {hits[0].rsplit("/", 1)[-1]}')
+                    written.append('s3://' + hits[0])
+                    continue
 
-            ds = read_model_var(model, scenario, member, variable, period)
-            if ds is None:
+            annual = _member_index_chunked(
+                model, scenario, member, variable, period, index_name,
+                threshold, freq=freq, season=season)
+            if annual is None:
                 print(f'  [WARN] no data: {model}/{scenario}/{member}/{variable}')
                 continue
-            da = get_variable_info(model, variable)['converter'](ds)
-            del ds
-
-            annual = compute_annual_index_for_member(
-                da, index_name, threshold, freq=freq, season=season).load()
-            del da
+            gc.collect()
             gc.collect()
 
+            # Percentile provenance belongs only on an index that has a
+            # percentile. Written unconditionally, a CDD or TXX file claims a
+            # baseline percentile it never used.
+            if threshold is not None:
+                annual.attrs.update({
+                    'percentile_baseline_scenario': 'SSP2-4.5',
+                    'percentile_baseline_period':
+                        f'{baseline_period.start_year}-'
+                        f'{baseline_period.end_year}',
+                    'percentile_baseline_years':
+                        baseline_period.end_year
+                        - baseline_period.start_year + 1,
+                    'percentile_baseline_members':
+                        ','.join(str(mm) for mm in ssp245_threshold_members),
+                    'percentile_method': 'xclim percentile_doy, 5-day centred '
+                                         'window, taken over all baseline '
+                                         'members pooled into one sample',
+                })
+                # Set by pooled_percentile_doy and by
+                # compute_baseline_threshold, and lost on the way out unless
+                # they are copied here. wet_day_threshold is the one fact that
+                # separates a current R95p file from a superseded one.
+                for key in ('wet_day_threshold', 'n_baseline_members',
+                            'percentile_baseline_members'):
+                    if key in threshold.attrs:
+                        annual.attrs[key] = threshold.attrs[key]
+            else:
+                fixed = info['extra_kwargs'].get('thresh')
+                if fixed is not None:
+                    annual.attrs['fixed_threshold'] = str(fixed)
+                annual.attrs['threshold_method'] = (
+                    'fixed threshold, no baseline percentile')
+
+            # Provenance, added 2 October 2026 after compare_hub_derecho.py found the
+            # Hub carrying 8 attributes where Cindy Wang's tree carries 22.
+            #
+            # Identity goes on every index. Without it a file is identified only by its
+            # path, and these trees were renamed once already on 2 October 2026.
             annual.attrs.update({
-                'percentile_baseline_scenario': 'SSP2-4.5',
-                'percentile_baseline_period':
-                    f'{baseline_period.start_year}-{baseline_period.end_year}',
-                'percentile_baseline_years':
-                    baseline_period.end_year - baseline_period.start_year + 1,
-                'percentile_baseline_members':
-                    ','.join(str(m) for m in ssp245_threshold_members),
-                'percentile_method': 'xclim percentile_doy, 5-day centred '
-                                     'window, averaged across baseline members',
+                'source_model': model_label,
+                'scenario': scen_label,
+                'member': member_label,
+                'source_member_id': str(member),
+                'created': pd.Timestamp.now().strftime('%Y-%m-%d'),
             })
-            
-            save_nc_to_s3(annual, s3_path)
+            if threshold is not None:
+                # The rest is percentile-only, by the rule the block above already
+                # states: a CDD or TXX file should claim nothing about a baseline it
+                # never used. The Derecho side writes these three unconditionally,
+                # through etccdi_site.baseline_attrs, which is the thing that comment
+                # was written to fix.
+                annual.attrs['percentile_sample'] = 'pooled across baseline members'
+                annual.attrs['percentile_convention_changed'] = (
+                    PERCENTILE_CONVENTION_CHANGED)
+                if model in BASELINE_NOTE:
+                    annual.attrs['baseline_caveat'] = BASELINE_NOTE[model]
+
+            # The span comes from the data, so the name is built here rather
+            # than before the read.
             yrs = annual['time'].dt.year.values
-            print(f'  wrote {model_label}/{scen_label}/{member_label}/{idx_file}  '
+            s3_path = (f'{member_dir}/{stem}_'
+                       f'{int(yrs.min())}-{int(yrs.max())}.nc')
+            save_nc_to_s3(annual, s3_path)
+            print(f'  wrote {s3_path.rsplit("/", 1)[-1]}  '
                   f'({len(yrs)} yrs {int(yrs.min())}-{int(yrs.max())})')
             written.append(s3_path)
             del annual
             gc.collect()
 
-    print(f'Done {index_name.upper()} for {model_label}: {len(written)} files.')
+    print(f'Done {index_name} for {model_label}: {len(written)} files.')
     return written
 
     
